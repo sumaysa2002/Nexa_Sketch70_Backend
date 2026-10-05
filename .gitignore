@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Environment variables
+.env
+.env.*
+
+# RSA keys / sensitive files
+keys/
+
+# Generated / build files
+dist/
+build/
+
+# Upload files
+uploads/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+
+
+
+# node_modules
+# # Keep environment variables out of version control
+# .env
+# *
+# # /app/generated/prisma
