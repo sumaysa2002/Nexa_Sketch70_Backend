@@ -4,7 +4,9 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "dev": "nodemon --watch src --ext ts --exec node --import tsx src/index.ts"
+    "dev": "nodemon --watch src --ext ts --exec node --import tsx src/index.ts",
+    "test": "node --import tsx --experimental-test-module-mocks --test src/services/otp.service.test.ts src/services/emailer.service.test.ts src/routes/auth.otp.test.ts",
+    "typecheck": "tsc --noEmit"
   },
   "author": "",
   "license": "ISC",
@@ -14,6 +16,7 @@
     "dotenv": "^17.2.3",
     "drizzle-orm": "^0.45.1",
     "express": "^5.2.1",
+    "express-rate-limit": "^8.7.1",
     "file-type": "^22.0.2",
     "jsonwebtoken": "^9.0.3",
     "multer": "^2.0.2",

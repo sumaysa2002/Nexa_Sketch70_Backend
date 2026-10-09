@@ -5,8 +5,16 @@ import express from "express";
 import authRouter from "./routes/auth.js";
 import taskRouter from "./routes/task.js"
 import point_task_Router from "./routes/point_task.js"
+import { assertOtpConfig } from "./services/otp.service.js";
 
 const app = express();
+
+// ถ้ารันหลัง reverse proxy / ngrok ให้ตั้ง TRUST_PROXY ใน .env (เช่น 1 = เชื่อ proxy 1 ชั้น)
+// เพื่อให้ rate limit เห็น IP ของผู้ใช้จริง ถ้าไม่ตั้ง ทุกคำขอจะถูกนับเป็น IP ของ proxy
+if (process.env.TRUST_PROXY) {
+  const trustProxy = process.env.TRUST_PROXY;
+  app.set("trust proxy", /^\d+$/.test(trustProxy) ? Number(trustProxy) : trustProxy);
+}
 
 app.use(express.json());
 app.use("/auth" , authRouter);
@@ -27,6 +35,9 @@ app.use((req, res) => {
 if (!process.env.ACCESS_TOKEN_SECRET) {
   throw new Error("ACCESS_TOKEN_SECRET is not set in .env");
 }
+
+// OTP_SECRET ต้องตั้งค่าและยาวพอ ไม่มีค่าเริ่มต้น ถ้าไม่ผ่านจะหยุดทำงานตั้งแต่เริ่ม
+assertOtpConfig();
 
 app.listen(3000, "0.0.0.0",() => {
   console.log('Server started on port 3000');
