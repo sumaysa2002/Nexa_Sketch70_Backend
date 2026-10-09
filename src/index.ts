@@ -2,9 +2,11 @@ import dotenv from "dotenv";
 dotenv.config();
 
 import express from "express";
+import { purgeOldOtpChallenges } from "./services/otp.service.js";
 import authRouter from "./routes/auth.js";
 import taskRouter from "./routes/task.js"
 import point_task_Router from "./routes/point_task.js"
+
 
 const app = express();
 
@@ -30,4 +32,7 @@ if (!process.env.ACCESS_TOKEN_SECRET) {
 
 app.listen(3000, "0.0.0.0",() => {
   console.log('Server started on port 3000');
+
+  // ลบ OTP ที่หมดอายุเกิน 1 วัน ทุก 6 ชั่วโมง
+  setInterval(() => purgeOldOtpChallenges().catch(console.error), 6 * 60 * 60 * 1000);
 });

@@ -6,6 +6,7 @@ import {
   numeric,
   timestamp,
   date,
+  index
 } from "drizzle-orm/pg-core";
 
 /* =======================
@@ -62,6 +63,26 @@ export const usersHistory = pgTable("users_history", {
 });
 
 /* =======================
+   OTP CHALLENGES TABLE
+   เก็บสถานะ OTP ฝั่ง server (ใช้ได้ครั้งเดียว / จำกัดจำนวนครั้งที่เดา / ผูกกับ purpose)
+   ทุกครั้งที่ระบบส่ง OTP จะเพิ่ม 1 แถวในตาราง
+======================= */
+export const otpChallenges = pgTable("otp_challenges", {
+    id:          text("id").primaryKey(),                                   // random 32 bytes (hex) >> เป็น Ref OTP
+    email:       text("email").notNull(),                                   
+    purpose:     text("purpose").notNull(),                                 // signup | login | reset_password
+    otp_hash:    text("otp_hash").notNull(),                                // HMAC ของ OTP (ไม่เก็บ OTP ตัวจริง)
+    attempts:    integer("attempts").notNull().default(0),                  // จำนวนครั้งที่กรอกไปแล้ว
+    expires_at:  timestamp("expires_at", { withTimezone: true }).notNull(), // เวลาหมดอายุ (สร้าง + 5 นาที)
+    consumed_at: timestamp("consumed_at", { withTimezone: true }),          // null = ยังใช้ได้ >> มีค่า = ปิดแล้ว (ใช้สำเร็จ หรือถูกแทนที่ด้วยรหัสใหม่)
+    verified_at: timestamp("verified_at", { withTimezone: true }),          // ยืนยันสำเร็จเมื่อไร (ใช้รีเซ็ตการนับโควตาขอ OTP)
+    created_at:  timestamp("created_at", { withTimezone: true }).notNull().defaultNow(), // เวลาสร้าง ใช้คำนวณ cooldown 60 วินาที และโควตาต่อชั่วโมง
+  },
+  (t) => [index("otp_challenges_email_purpose_idx").on(t.email, t.purpose, t.created_at)]
+);
+
+
+/* =======================
    TYPES
 ======================= */
 export type User = typeof users.$inferSelect;
@@ -69,6 +90,8 @@ export type NewUser = typeof users.$inferInsert;
 
 export type UserHistory = typeof usersHistory.$inferSelect;
 export type NewUserHistory = typeof usersHistory.$inferInsert;
+
+export type OtpChallenge = typeof otpChallenges.$inferSelect;
 
 
 //---------------------------------------------------------------------------------------------------

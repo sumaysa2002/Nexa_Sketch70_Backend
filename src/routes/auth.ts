@@ -6,7 +6,15 @@ import { eq, ne, and, or, sql, asc, inArray } from "drizzle-orm"; // ฟัง�
 import bcryptjs from "bcryptjs"; // ใช้ hash password
 import jwt from "jsonwebtoken";
 import { auth, type AuthRequest } from "../middleware/auth.js"; // ใช้ตรวจสอบ JWT token ก่อนเข้าถึง route ที่ต้อง login
-import { sendOTP, verifyOTP } from "../services/otp.service.js";
+import {
+  sendOTP,
+  verifyOTP,
+  isKnownChallenge,
+  otpFailureMessage,
+  OtpError,
+  type OtpVerifyResult,
+} from "../services/otp.service.js";
+import crypto from "crypto";
 import { emptyToNull, toNumericOrNull, toIntOrNull } from "../helper/null.js";
 import multer from "multer";
 import path from "path";
@@ -20,6 +28,43 @@ const authRouter = Router();
 function sanitizeUser<T extends { password?: unknown }>(u: T): Omit<T, "password"> {
   const { password, ...safeUser } = u;
   return safeUser;
+}
+
+/// ─── ตัวช่วยฝั่ง OTP / validation ──────────
+const MIN_PASSWORD_LENGTH = 6; // ให้ตรงกับ Flutter
+const isNonEmptyString = (v: unknown): v is string => typeof v === "string" && v.trim().length > 0;
+
+// hash จำลองไว้ใช้ตอน bcrypt.compare กรณีไม่พบ user → ใช้เวลาเท่ากัน เดาไม่ได้ว่าอีเมลมีในระบบหรือไม่
+const DUMMY_PASSWORD_HASH = bcryptjs.hashSync(crypto.randomBytes(16).toString("hex"), 10);
+
+// แปลง error จาก OTP service เป็น response (errorKey = ชื่อฟิลด์ที่ Flutter อ่าน: "message" หรือ "error")
+function sendOtpError(
+  res: Response,
+  e: unknown,
+  fallback: string,
+  errorKey: "message" | "error" = "message"
+) {
+  if (e instanceof OtpError) {
+    if (e.retryAfterSeconds) res.set("Retry-After", String(e.retryAfterSeconds));
+    return res.status(e.status).json({
+      [errorKey]: e.message,
+      ...(e.retryAfterSeconds ? { retry_after_seconds: e.retryAfterSeconds } : {}),
+    });
+  }
+  console.error("[OTP] error:", e);
+  return res.status(500).json({ [errorKey]: fallback });
+}
+
+// ตอบกลับเมื่อยืนยัน OTP ไม่ผ่าน → แนบจำนวนครั้งที่กรอกไปแล้ว ให้หน้า OTP แสดงได้
+function sendOtpVerifyFail(res: Response, r: OtpVerifyResult) {
+  return res.status(400).json({
+    message: otpFailureMessage(r),
+    reason: r.reason,
+    attempts: r.attempts,
+    max_attempts: r.maxAttempts,
+    remaining_attempts: r.remaining,
+    ref_code: r.refCode,
+  });
 }
 
 
@@ -47,10 +92,10 @@ const storage = multer.diskStorage({
         cb(null, uploadDir);
     },
     filename: (req, file, cb) => {
-        // ใช้ email ตั้งชื่อไฟล์ชั่วคราว (เพราะยังไม่มี userId)
-        const emailPrefix = req.body.email ? req.body.email.split('@')[0] : 'user';
-        const uniqueSuffix = `${Date.now()}_${++_authFileCounter}`;
-        cb(null, `${emailPrefix}_${file.fieldname}_${uniqueSuffix}${path.extname(file.originalname)}`);
+        // ชื่อไฟล์ชั่วคราวแบบสุ่มทั้งหมด (ห้ามใช้ข้อมูลจาก client เช่น email → เสี่ยง path traversal)
+        const ext = path.extname(file.originalname).toLowerCase();
+        const uniqueSuffix = `${Date.now()}_${++_authFileCounter}_${crypto.randomBytes(8).toString("hex")}`;
+        cb(null, `tmp_${file.fieldname}_${uniqueSuffix}${ext}`);
     }
 });
 
@@ -161,12 +206,16 @@ authRouter.post("/signup/check_email", async (req: Request, res: Response) => {
 authRouter.post("/signup/send_otp", async (req: Request, res: Response) => {
   try {
     const { email } = req.body;
-    if (!email) return res.status(400).json({ message: "กรุณาระบุอีเมล" });
+    if (!isNonEmptyString(email)) return res.status(400).json({ message: "กรุณาระบุอีเมล" });
 
-    const hash = await sendOTP({ email });
-    res.status(200).json({ success: true, hash });
+    // อีเมลที่สมัครแล้ว ไม่ต้องส่ง OTP สมัครสมาชิก
+    const [existing] = await db.select({ id: users.id }).from(users).where(eq(users.email, email));
+    if (existing) return res.status(409).json({ message: "อีเมลนี้อยู่ในระบบแล้ว" });
+
+    const { hash, refCode } = await sendOTP({ email, purpose: "signup" });
+    res.status(200).json({ success: true, hash, ref_code: refCode });
   } catch (error) {
-    res.status(500).json({ message: "ส่ง OTP ไม่สำเร็จ" });
+    return sendOtpError(res, error, "ส่ง OTP ไม่สำเร็จ");
   }
 });
 
@@ -209,11 +258,20 @@ authRouter.post("/signup/verify_and_register",
         // ดึง OTP และ hash
         const { otp, hash } = req.body;
 
-        // ตรวจสอบ OTP
-        const isValid = verifyOTP({ email: payload.email, otp, hash });
-        if (!isValid) {
-            if (req.file) fs.unlinkSync(req.file.path);
-            return res.status(400).json({ message: "รหัส OTP ไม่ถูกต้องหรือหมดอายุ" });
+        // ตรวจข้อมูลจำเป็นก่อน (ยังไม่ใช้ OTP ถ้าข้อมูลไม่ครบ)
+        if (
+          !payload || !isNonEmptyString(payload.email) ||
+          typeof payload.password !== "string" || payload.password.length < MIN_PASSWORD_LENGTH
+        ) {
+            safeUnlink(req.file?.path);
+            return res.status(400).json({ message: "ข้อมูลไม่ครบถ้วนหรือรหัสผ่านสั้นเกินไป" });
+        }
+
+        // ตรวจสอบ OTP (ต้อง await และต้องเป็น OTP ของการสมัครสมาชิกเท่านั้น)
+        const otpResult = await verifyOTP({ email: payload.email, otp, hash, purpose: "signup" });
+        if (!otpResult.ok) {
+            safeUnlink(req.file?.path);
+            return sendOtpVerifyFail(res, otpResult);
         }
 
         // Hash Password
@@ -273,7 +331,7 @@ authRouter.post("/signup/verify_and_register",
         res.status(201).json({ message: "สมัครสมาชิกสำเร็จ", user_id: result.id });
     } catch (error) {
         console.error(error);
-        if (req.file) fs.unlinkSync(req.file.path);
+        safeUnlink(req.file?.path);
         res.status(500).json({ message: "สมัครสมาชิกไม่สำเร็จ" });
     }
 });
@@ -290,6 +348,9 @@ authRouter.post("/login", async (req: Request, res: Response) => {
 
     // รับ Email และ Password
     const { email, password } = req.body;
+    if (!isNonEmptyString(email) || typeof password !== "string") {
+      return res.status(400).json({ error: "อีเมลหรือรหัสผ่านไม่ถูกต้อง" });
+    }
 
     // ค้นหา User จาก Email
     const [existingUser] = await db
@@ -297,36 +358,49 @@ authRouter.post("/login", async (req: Request, res: Response) => {
       .from(users)
       .where(eq(users.email, email));
 
-    // ไม่พบ Email
-    if (!existingUser) {
+    // เทียบรหัสผ่านเสมอ (ถ้าไม่พบ user ใช้ hash จำลอง) → เวลาตอบกลับเท่ากันทั้งสองกรณี
+    const isMatch = await bcryptjs.compare(password, existingUser?.password ?? DUMMY_PASSWORD_HASH);
+    if (!existingUser || !isMatch) {
       return res.status(400).json({ error: "อีเมลหรือรหัสผ่านไม่ถูกต้อง" });
     }
 
-    // ไม่พบ password
-    const isMatch = await bcryptjs.compare(password, existingUser.password);
-    if (!isMatch) {
-      return res.status(400).json({ error: "อีเมลหรือรหัสผ่านไม่ถูกต้อง" });
-    }
+    // ส่ง OTP ไป Email (ใช้อีเมลจาก DB)
+    const { hash, refCode } = await sendOTP({ email: existingUser.email, purpose: "login" });
 
-    // ส่ง OTP ไป Email
-    const hash = await sendOTP({ email });
-
-    // ส่งข้อมูล User ให้ Flutter (ยกเว้นข้อมูล password)
-    const tempUser = sanitizeUser(existingUser);
-    
+    // ก่อนยืนยัน OTP ส่งกลับแค่ email เท่านั้น
+    // (ข้อมูลผู้ใช้ทั้งหมดจะได้หลังยืนยัน OTP ผ่านใน /login/verify_otp)
     res.json({
       message: "OTP sent to email",
       hash,
-      tempUser,
+      ref_code: refCode,
+      tempUser: { email: existingUser.email },
     });
 
   } catch (error) {
-  console.error("Login error:", error);
+    return sendOtpError(res, error, "เกิดข้อผิดพลาดในการเข้าสู่ระบบ", "error");
+  }
+});
 
-  return res.status(500).json({
-    error: "เกิดข้อผิดพลาดในการเข้าสู่ระบบ"
-  });
-}
+
+/// ── ขอ OTP Login ใหม่ (ต้องแนบ hash เดิมที่ได้จาก /login มาด้วย) ──────────────
+authRouter.post("/login/resend_otp", async (req: Request, res: Response) => {
+  try {
+    const { email, hash } = req.body;
+    if (!isNonEmptyString(email) || !isNonEmptyString(hash)) {
+      return res.status(400).json({ message: "ข้อมูลไม่ครบถ้วน" });
+    }
+
+    // อนุญาตเฉพาะคนที่ผ่านขั้นตอน email + password มาแล้วเท่านั้น
+    const known = await isKnownChallenge({ email, hash, purpose: "login" });
+    if (!known) {
+      return res.status(400).json({ message: "กรุณาเข้าสู่ระบบใหม่อีกครั้ง" });
+    }
+
+    const { hash: newHash, refCode } = await sendOTP({ email, purpose: "login" });
+    res.status(200).json({ success: true, hash: newHash, ref_code: refCode });
+  } catch (error) {
+    return sendOtpError(res, error, "ส่ง OTP ไม่สำเร็จ");
+  }
 });
 
 
@@ -335,13 +409,13 @@ authRouter.post("/login/verify_otp", async (req: Request, res: Response) => {
     try {
         const { email, otp, hash } = req.body;
 
-        if (!email || !otp || !hash) {
+        if (!isNonEmptyString(email) || !isNonEmptyString(otp) || !isNonEmptyString(hash)) {
             return res.status(400).json({ message: "ข้อมูลไม่ครบถ้วน" });
         }
 
-        const isValid = verifyOTP({ email, otp, hash });
-        if (!isValid) {
-            return res.status(400).json({ message: "รหัส OTP ไม่ถูกต้องหรือหมดอายุ" });
+        const otpResult = await verifyOTP({ email, otp, hash, purpose: "login" });
+        if (!otpResult.ok) {
+            return sendOtpVerifyFail(res, otpResult);
         }
 
         // ดึง user จาก email ที่ยืนยัน OTP ผ่านแล้วเท่านั้น
@@ -365,19 +439,49 @@ authRouter.post("/login/verify_otp", async (req: Request, res: Response) => {
 });
 
 
+/// ── Reset Password ด้วย Email >> ส่ง OTP ──────────────────────
+authRouter.post("/login/reset_password/send_otp", async (req: Request, res: Response) => {
+  try {
+    const { email } = req.body;
+    if (!isNonEmptyString(email)) return res.status(400).json({ message: "กรุณาระบุอีเมล" });
+
+    const [existingUser] = await db
+      .select({ email: users.email })
+      .from(users)
+      .where(eq(users.email, email));
+
+    // ไม่พบอีเมล → สร้าง challenge จริงแต่ไม่ส่งเมล
+    // ทำให้ response, rate limit และผลตอนกรอกรหัส (นับครั้ง/ล็อก) เหมือนกรณีปกติทุกอย่าง
+    // จึงใช้หน้านี้เดาไม่ได้ว่าอีเมลนี้มีในระบบหรือไม่
+    const { hash, refCode } = await sendOTP({
+      email: existingUser?.email ?? email,
+      purpose: "reset_password",
+      deliver: !!existingUser,
+    });
+    res.status(200).json({ success: true, hash, ref_code: refCode });
+  } catch (error) {
+    return sendOtpError(res, error, "ส่ง OTP ไม่สำเร็จ");
+  }
+});
+
+
 /// ── Reset Password ด้วย Email >> ยืนยัน OTP และเปลี่ยนรหัสผ่าน ──────────────────────
 authRouter.post("/login/reset_password/verify_and_reset", async (req: Request, res: Response) => {
   try {
 
     const { email, otp, hash, new_password } = req.body;
 
-    if (!email || !otp || !hash || !new_password) {
+    if (!isNonEmptyString(email) || !isNonEmptyString(otp) || !isNonEmptyString(hash) || typeof new_password !== "string") {
       return res.status(400).json({ message: "ข้อมูลไม่ครบถ้วน" });
     }
 
-    const isValid = verifyOTP({ email, otp, hash });
-    if (!isValid) {
-      return res.status(400).json({ message: "รหัส OTP ไม่ถูกต้องหรือหมดอายุ" });
+    if (new_password.length < MIN_PASSWORD_LENGTH) {
+      return res.status(400).json({ message: `รหัสผ่านต้องมีอย่างน้อย ${MIN_PASSWORD_LENGTH} ตัวอักษร` });
+    }
+
+    const otpResult = await verifyOTP({ email, otp, hash, purpose: "reset_password" });
+    if (!otpResult.ok) {
+      return sendOtpVerifyFail(res, otpResult);
     }
 
     const hashedPassword = await bcryptjs.hash(new_password, 10);
