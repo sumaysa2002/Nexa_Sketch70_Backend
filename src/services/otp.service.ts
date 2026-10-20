@@ -20,7 +20,7 @@ const RESEND_COOLDOWN_S = 60;                                           // ข�
 // โควตาการขอ OTP (ต่ออีเมล + purpose) — เริ่มนับใหม่ทุกครั้งที่ยืนยัน OTP สำเร็จ (ทุก purpose ของอีเมลนั้น)
 const MAX_SENDS_PER_BATCH   = 5;   // ขอได้กี่ครั้งต่อรอบ
 const BATCH_BLOCK_MINUTES   = 15;  // ขอครบรอบแล้วต้องรอกี่นาที (นับจากครั้งสุดท้ายของรอบ)
-const MAX_SENDS_PER_DAY     = 20;  // เพดานใน 24 ชม.
+const MAX_SENDS_PER_DAY     = 15;  // เพดานใน 24 ชม.
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 export type OtpPurpose = "signup" | "login" | "reset_password";

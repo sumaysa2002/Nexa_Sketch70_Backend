@@ -10,6 +10,7 @@ import multer from "multer";
 import path from "path";
 import fs from "fs";
 import { fileTypeFromFile } from "file-type";
+import { normalizeUploadedFiles, ImageProcessError, POINT_IMAGE_OPTIONS } from "../helper/image.js";
 
 
 const point_task_Router = Router();
@@ -39,6 +40,52 @@ async function canEditProject(userId: number, projectId: number): Promise<boolea
 
   if (currentUser?.status === "admin" && creatorId === userId) return true;
 
+  const [member] = await db
+    .select({ id: projectMembers.id })
+    .from(projectMembers)
+    .where(
+      and(
+        eq(projectMembers.project_id, projectId),
+        eq(projectMembers.user_id, userId)
+      )
+    );
+
+  return !!member;
+}
+
+
+/// ─── ตรวจสอบว่า user นี้มีสิทธิ์เข้าถึงโครงการนี้หรือไม่ ────────────────────────────────────
+async function canViewProject(userId: number, projectId: number): Promise<boolean> {
+  const [creatorRow] = await db
+    .select({ project_user_creator: projectHistory.project_user_creator })
+    .from(projectHistory)
+    .where(
+      and(
+        eq(projectHistory.project_id, projectId),
+        sql`${projectHistory.project_user_creator} IS NOT NULL`
+      )
+    )
+    .orderBy(asc(projectHistory.project_time_created))
+    .limit(1);
+
+  const creatorId = creatorRow?.project_user_creator ?? null;
+  if (creatorId === null) return false; // ไม่พบโครงการ
+
+  const [currentUser] = await db
+    .select({ status: users.status, admin: users.admin })
+    .from(users)
+    .where(eq(users.id, userId));
+
+  if (!currentUser) return false;
+
+  if (currentUser.status === "admin") return creatorId === userId;
+  if (currentUser.status !== "user")  return false;
+
+  // user ในกลุ่มของ admin ผู้สร้างโครงการ
+  const adminId = currentUser.admin ? parseInt(currentUser.admin) : NaN;
+  if (adminId === creatorId) return true;
+
+  // เป็นสมาชิกโครงการโดยตรง
   const [member] = await db
     .select({ id: projectMembers.id })
     .from(projectMembers)
@@ -86,9 +133,9 @@ const tempDir = "uploads/point/temp";
 if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
 
 // ─── อนุญาตเฉพาะไฟล์ประเภทรูปภาพเท่านั้น (ตรวจทั้ง mimetype และนามสกุลไฟล์) ────
-const ALLOWED_MIME_TYPES = ["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif", "application/octet-stream"];
-const ALLOWED_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"];
-const ALLOWED_REAL_IMAGE_EXTS = ["jpg", "jpeg", "png", "webp", "heic", "heif"];
+const ALLOWED_MIME_TYPES = ["image/jpeg", "image/png", "image/webp", "application/octet-stream"];
+const ALLOWED_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp"];
+const ALLOWED_REAL_IMAGE_EXTS = ["jpg", "png", "webp"];
 
 const imageFileFilter = (
   req: any,
@@ -103,7 +150,7 @@ const imageFileFilter = (
   if (isMimeOk && isExtOk) {
     cb(null, true);
   } else {
-    cb(new Error("อนุญาตเฉพาะไฟล์ประเภทรูปภาพเท่านั้น (jpg, jpeg, png, webp, heic, heif)"));
+    cb(new Error("อนุญาตเฉพาะไฟล์ประเภทรูปภาพเท่านั้น (jpg, jpeg, png, webp)"));
   }
 };
 
@@ -127,8 +174,9 @@ function safeUnlink(filePath?: string) {
   }
 }
 
-/// จำกัดขนาดไฟล์สูงสุด 20MB ต่อไฟล์
-const MAX_IMAGE_SIZE = 20 * 1024 * 1024;
+/// จำกัดขนาดไฟล์สูงสุด 15MB ต่อไฟล์
+const MAX_IMAGE_SIZE = 15 * 1024 * 1024;
+const MAX_IMAGE_SIZE_MB = MAX_IMAGE_SIZE / 1024 / 1024;
 
 // counter ป้องกัน timestamp ชนกัน (แก้ปัญหาชื่อไฟล์ซ้ำ)
 let _fileCounter = 0;
@@ -146,7 +194,7 @@ const uploadFields = multer({
   storage,
   fileFilter: imageFileFilter,
   limits: {
-    fileSize: MAX_IMAGE_SIZE,     // ขนาดไฟล์รูปสูงสุด 20MB ต่อไฟล์
+    fileSize: MAX_IMAGE_SIZE,     // ขนาดไฟล์รูปสูงสุดต่อไฟล์
     fieldSize: 50 * 1024 * 1024,  // ขนาด text field สูงสุด 50MB
   },
 }).fields(
@@ -159,7 +207,7 @@ function handleUploadFields(req: any, res: Response, next: any) {
   uploadFields(req, res, (err: any) => {
     if (err instanceof multer.MulterError) {
       if (err.code === "LIMIT_FILE_SIZE") {
-        return res.status(400).json({ error: "ไฟล์รูปภาพห้ามมีขนาดเกิน 20MB" });
+        return res.status(400).json({ error: `ไฟล์รูปภาพห้ามมีขนาดเกิน ${MAX_IMAGE_SIZE_MB}MB` });
       }
       return res.status(400).json({ error: err.message });
     } else if (err) {
@@ -193,6 +241,29 @@ async function verifyUploadedImages(req: any, res: Response, next: any) {
   next();
 }
 
+// ─── ประมวลผลรูปภาพทุกไฟล์ (ตัดข้อมูลแปลกปลอมในไฟล์) ────
+async function normalizeImages(req: any, res: Response, next: any) {
+  const files = req.files as { [fieldname: string]: Express.Multer.File[] } | undefined;
+
+  const candidates = IMAGE_FIELDS
+    .map((f) => files?.[f]?.[0])
+    .filter(Boolean) as Express.Multer.File[];
+
+  if (candidates.length === 0) return next();
+
+  try {
+    await normalizeUploadedFiles(candidates, () => POINT_IMAGE_OPTIONS);
+    next();
+  } catch (e) {
+    candidates.forEach((f) => safeUnlink(f.path));
+    if (e instanceof ImageProcessError) {
+      return res.status(400).json({ error: e.message });
+    }
+    console.error("[normalizeImages] error:", e);
+    return res.status(500).json({ error: "ประมวลผลรูปภาพไม่สำเร็จ" });
+  }
+}
+
 
 
 
@@ -205,6 +276,7 @@ point_task_Router.post("/create_point",
   auth,
   handleUploadFields,
   verifyUploadedImages,
+  normalizeImages,
   async (req: AuthRequest, res: Response) => {
 
     const files = req.files as
@@ -417,6 +489,13 @@ point_task_Router.get("/points/:project_id",
         return;
       }
 
+      // ตรวจสอบสิทธิ์เข้าถึงข้อมูลโครงการนี้
+      const hasAccess = await canViewProject(req.user!, projectId);
+      if (!hasAccess) {
+        res.status(403).json({ error: "ไม่มีสิทธิ์เข้าถึงข้อมูลในโครงการนี้" });
+        return;
+      }
+
       const allPoints = await db
       .select({
         ...getTableColumns(points),
@@ -442,6 +521,7 @@ point_task_Router.put("/update_point/:point_id",
   auth,
   handleUploadFields,
   verifyUploadedImages,
+  normalizeImages,
   async (req: AuthRequest, res: Response) => {
 
     const files = req.files as
@@ -741,6 +821,61 @@ point_task_Router.delete("/delete_point/:point_id",
 
 
 
+/// ── ส่งไฟล์รูปของ Point (ต้อง login + มีสิทธิ์เข้าถึงโครงการ) ──────────────
+const POINT_UPLOAD_ROOT = path.resolve("uploads", "point");
+
+point_task_Router.get("/image/:project_id/:point_id/:filename",
+  auth,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const projectId = parseInt(req.params["project_id"] as string);
+      const pointId   = parseInt(req.params["point_id"] as string);
+      const filename  = String(req.params["filename"] ?? "");
+
+      if (isNaN(projectId) || isNaN(pointId) || !filename) {
+        res.status(400).json({ error: "คำขอไม่ถูกต้อง" });
+        return;
+      }
+
+      // ตรวจสิทธิ์
+      const hasAccess = await canViewProject(req.user!, projectId);
+      if (!hasAccess) {
+        res.status(403).json({ error: "ไม่มีสิทธิ์เข้าถึงข้อมูลในโครงการ" });
+        return;
+      }
+
+      const [p] = await db
+        .select()
+        .from(points)
+        .where(and(eq(points.id, pointId), eq(points.project_id, projectId)));
+
+      // ชื่อไฟล์ต้องตรงกับที่บันทึกไว้ใน DB
+      const isOwnFile =
+        !!p &&
+        path.basename(filename) === filename &&
+        IMAGE_FIELDS.some((f) => p[f] === filename);
+
+      if (!isOwnFile) {
+        res.status(404).json({ error: "ไม่พบรูปภาพ" });
+        return;
+      }
+
+      const filePath = path.join(POINT_UPLOAD_ROOT, String(projectId), String(pointId), filename);
+
+      res.set("Cache-Control", "private, max-age=300");
+      res.set("X-Content-Type-Options", "nosniff");
+      res.sendFile(filePath, { dotfiles: "deny" }, (err) => {
+        if (err && !res.headersSent) {
+          res.status(404).json({ error: "ไม่พบรูปภาพ" });
+        }
+      });
+    } catch (e) {
+      console.error("[GET /image] error:", e);
+      if (!res.headersSent) res.status(500).json({ error: "ดึงรูปภาพไม่สำเร็จ" });
+    }
+  }
+);
+
+
+
 export default point_task_Router;
-
-

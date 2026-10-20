@@ -20,6 +20,12 @@ import multer from "multer";
 import path from "path";
 import fs from "fs";
 import { fileTypeFromFile } from "file-type";
+import {
+  normalizeUploadedFiles,
+  ImageProcessError,
+  PROFILE_IMAGE_OPTIONS,
+  SIGNATURE_IMAGE_OPTIONS,
+} from "../helper/image.js";
 
 
 const authRouter = Router();
@@ -99,10 +105,10 @@ const storage = multer.diskStorage({
     }
 });
 
-/// ─── อนุญาตเฉพาะไฟล์ประเภทรูปภาพเท่านั้น (ตรวจทั้ง mimetype และนามสกุลไฟล์) ────────────────────────────────────
-const ALLOWED_MIME_TYPES = ["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"];
-const ALLOWED_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"];
-const ALLOWED_REAL_IMAGE_EXTS = ["jpg", "jpeg", "png", "webp", "heic", "heif"];
+// ─── อนุญาตเฉพาะไฟล์ประเภทรูปภาพเท่านั้น (ตรวจทั้ง mimetype และนามสกุลไฟล์) ────
+const ALLOWED_MIME_TYPES = ["image/jpeg", "image/png", "image/webp"];
+const ALLOWED_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp"];
+const ALLOWED_REAL_IMAGE_EXTS = ["jpg", "png", "webp"];
 
 const imageFileFilter = (
   req: Request,
@@ -117,7 +123,7 @@ const imageFileFilter = (
   if (isMimeOk && isExtOk) {
     cb(null, true);
   } else {
-    cb(new Error("อนุญาตเฉพาะไฟล์ประเภทรูปภาพเท่านั้น (jpg, jpeg, png, webp, heic, heif)"));
+    cb(new Error("อนุญาตเฉพาะไฟล์ประเภทรูปภาพเท่านั้น (jpg, jpeg, png, webp)"));
   }
 };
 
@@ -141,8 +147,24 @@ function safeUnlink(filePath?: string) {
   }
 }
 
-/// จำกัดขนาดไฟล์สูงสุด 10MB ต่อไฟล์
-const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
+/// จำกัดขนาดไฟล์สูงสุด 5MB ต่อไฟล์
+const MAX_IMAGE_SIZE = 5 * 1024 * 1024;
+const MAX_IMAGE_SIZE_MB = MAX_IMAGE_SIZE / 1024 / 1024;
+
+// ─── ประมวลผลรูปภาพทุกไฟล์ (ตัดข้อมูลแปลกปลอมในไฟล์) ────
+async function normalizeUserImages(files: Express.Multer.File[]): Promise<string | null> {
+  try {
+    await normalizeUploadedFiles(files, (f) =>
+      f.fieldname === "signature_image" ? SIGNATURE_IMAGE_OPTIONS : PROFILE_IMAGE_OPTIONS
+    );
+    return null;
+  } catch (e) {
+    files.forEach((f) => safeUnlink(f.path));
+    if (e instanceof ImageProcessError) return e.message;
+    console.error("[normalizeUserImages] error:", e);
+    return "ประมวลผลรูปภาพไม่สำเร็จ";
+  }
+}
 
 /// ใช้ตอนสมัครสมาชิก (มีแค่ profile_image)
 const upload = multer({ 
@@ -226,7 +248,7 @@ authRouter.post("/signup/verify_and_register",
     upload.single('profile_image')(req, res, (err: any) => {
       if (err instanceof multer.MulterError) {
         if (err.code === 'LIMIT_FILE_SIZE') {
-          return res.status(400).json({ message: "ไฟล์รูปภาพห้ามมีขนาดเกิน 10MB" });
+          return res.status(400).json({ message: `ไฟล์รูปภาพห้ามมีขนาดเกิน ${MAX_IMAGE_SIZE_MB}MB` });
         }
         return res.status(400).json({ message: err.message });
       } else if (err) {
@@ -247,6 +269,10 @@ authRouter.post("/signup/verify_and_register",
         message: "ไฟล์ที่แนบมาไม่ใช่ไฟล์ประเภทรูปภาพ",
       });
     }
+
+    const imageError = await normalizeUserImages([req.file]);
+    if (imageError) return res.status(400).json({ message: imageError });
+
     next();
   },
   async (req: Request, res: Response) => {
@@ -548,7 +574,7 @@ authRouter.put("/update_user",
     uploadFields(req, res, (err: any) => {
       if (err instanceof multer.MulterError) {
         if (err.code === 'LIMIT_FILE_SIZE') {
-          return res.status(400).json({ error: "ไฟล์รูปภาพห้ามมีขนาดเกิน 10MB" });
+          return res.status(400).json({ error: `ไฟล์รูปภาพห้ามมีขนาดเกิน ${MAX_IMAGE_SIZE_MB}MB` });
         }
         return res.status(400).json({ error: err.message });
       } else if (err) {
@@ -578,6 +604,10 @@ authRouter.put("/update_user",
         });
       }
     }
+
+    const imageError = await normalizeUserImages(candidates);
+    if (imageError) return res.status(400).json({ error: imageError });
+
     next();
   },
   async (req: AuthRequest, res: Response) => {
@@ -1054,6 +1084,118 @@ authRouter.put("/revoke_approval_user/:userId", auth, async (req: AuthRequest, r
   }
 });
 
+
+
+
+/* ============================================================
+   5) ส่งไฟล์รูปโปรไฟล์ / ลายเซ็น (ต้อง login)
+============================================================ */
+const PROFILE_ROOT   = path.resolve(uploadDir);
+const SIGNATURE_ROOT = path.resolve(signatureDir);
+
+// ลักษณะชื่อไฟล์
+function isPlainFilename(name: string): boolean {
+  return !!name && path.basename(name) === name && !name.startsWith(".");
+}
+
+function sendImageFile(res: Response, root: string, filename: string, cacheControl: string) {
+  res.set("Cache-Control", cacheControl);
+  res.set("X-Content-Type-Options", "nosniff");
+  res.sendFile(path.join(root, filename), { dotfiles: "deny" }, (err) => {
+    if (err && !res.headersSent) {
+      res.status(404).json({ error: "ไม่พบรูปภาพ" });
+    }
+  });
+}
+
+/// ─── ตรวจสอบสิทธิ์ลายเซ็นของ user ────────────────────────────
+async function canViewSignature(viewerId: number, ownerId: number): Promise<boolean> {
+  if (viewerId === ownerId) return true;
+
+  const [me] = await db
+    .select({ status: users.status, admin: users.admin })
+    .from(users)
+    .where(eq(users.id, viewerId));
+
+  if (!me) return false;
+
+  const myAdminId = me.status === "admin" ? viewerId : (me.admin ? parseInt(me.admin) : null);
+  if (!myAdminId || isNaN(myAdminId)) return false;
+
+  if (ownerId === myAdminId) return true;
+
+  const [row] = await db
+    .select({ id: usersHistory.id })
+    .from(usersHistory)
+    .where(
+      and(
+        eq(usersHistory.user_id, ownerId),
+        or(
+          eq(usersHistory.admin_approved_user, myAdminId),
+          eq(usersHistory.admin_revoke_approval_user, myAdminId)
+        )
+      )
+    )
+    .limit(1);
+
+  return !!row;
+}
+
+/// ── รูปโปรไฟล์: ผู้ใช้ที่ login ─────────────────────────────
+authRouter.get("/image/profile/:filename", auth, async (req: AuthRequest, res: Response) => {
+  try {
+    const filename = String(req.params["filename"] ?? "");
+    if (!isPlainFilename(filename)) {
+      res.status(400).json({ error: "คำขอไม่ถูกต้อง" });
+      return;
+    }
+
+    // ต้องเป็นชื่อไฟล์ที่บันทึกเป็น profile ของ user
+    const [owner] = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.profile_img, filename))
+      .limit(1);
+
+    if (!owner) {
+      res.status(404).json({ error: "ไม่พบรูปภาพ" });
+      return;
+    }
+
+    sendImageFile(res, PROFILE_ROOT, filename, "private, max-age=300");
+  } catch (e) {
+    console.error("[GET /image/profile] error:", e);
+    if (!res.headersSent) res.status(500).json({ error: "ดึงข้อมูลรูปภาพไม่สำเร็จ" });
+  }
+});
+
+/// ── ลายเซ็น: user หรือคนในกลุ่ม admin เดียวกัน ─────────────────
+authRouter.get("/image/signature/:filename", auth, async (req: AuthRequest, res: Response) => {
+  try {
+    const filename = String(req.params["filename"] ?? "");
+    if (!isPlainFilename(filename)) {
+      res.status(400).json({ error: "คำขอไม่ถูกต้อง" });
+      return;
+    }
+
+    const [owner] = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.signature, filename))
+      .limit(1);
+
+    // ไม่พบ หรือไม่มีสิทธิ์
+    if (!owner || !(await canViewSignature(req.user!, owner.id))) {
+      res.status(404).json({ error: "ไม่พบรูปภาพ" });
+      return;
+    }
+
+    sendImageFile(res, SIGNATURE_ROOT, filename, "private, no-store");
+  } catch (e) {
+    console.error("[GET /image/signature] error:", e);
+    if (!res.headersSent) res.status(500).json({ error: "ดึงข้อมูลรูปภาพไม่สำเร็จ" });
+  }
+});
 
 
 

@@ -15,7 +15,7 @@ app.use("/auth" , authRouter);
 app.use("/tasks" , taskRouter);
 app.use("/point_tasks" , point_task_Router);
 
-app.use('/uploads', express.static('uploads'));
+//app.use('/uploads', express.static('uploads'));
 app.use("/points", point_task_Router);
 
 app.get("/", (req, res) => {
