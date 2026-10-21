@@ -1,4 +1,3 @@
-//import type { UUID } from "crypto"; // ใช้เป็น type ของ user id (UUID จาก Postgres)
 import type { NextFunction, Request, Response } from "express";
 import jwt from "jsonwebtoken"; // ใช้ verify JWT
 import { db } from "../db/index.js"; // ตัวเชื่อม database (Drizzle)
@@ -23,17 +22,16 @@ export const auth = async (
 
         // ถ้าไม่มี token → ตัดทิ้งทันที
         if (!token) {
-          res.status(401).json({ error: "ไม่พบ token, การเข้าถึงถูกปฏิเสธ!" });
+          res.status(401).json({ error: "ไม่พบ token หรือการเข้าถึงถูกปฏิเสธ" });
           return;
         }
 
     // ตรวจสอบ JWT (verify) >> ตรวจลายเซ็น, ตรวจว่า token ถูกสร้างด้วย secret เดียวกัน, ตรวจว่า token ไม่พัง / ไม่โดนแก้
     const verified = jwt.verify(token, process.env.ACCESS_TOKEN_SECRET!);
-    //const verified = jwt.verify(token, "passwordKey");
 
     // ถ้า token ผิด → throw error → เข้า catch
     if (!verified) {
-      res.status(401).json({ error: "การตรวจสอบ Token ล้มเหลว!" });
+      res.status(401).json({ error: "การตรวจสอบ Token ล้มเหลว" });
       return;
     }
 
@@ -57,8 +55,6 @@ export const auth = async (
     req.token = token;
     next();
   } catch (e) {
-    // ✅ เปลี่ยนจาก 500 → 401 เพราะ error ตรงนี้ส่วนใหญ่คือ token ผิด/หมดอายุ ไม่ใช่ server พัง
     res.status(401).json({ error: "Token ไม่ถูกต้องหรือหมดอายุ" });
-    // res.status(500).json({ error: e });
   }
 };
