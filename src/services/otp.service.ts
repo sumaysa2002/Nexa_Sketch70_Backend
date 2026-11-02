@@ -84,6 +84,9 @@ export const sendOTP = async ({
   const normEmail = normalizeEmail(email);
   const now = new Date();
 
+  // 0. ลบแถวเก่าที่หมดอายุเกิน 1 วันทิ้ง (ทำทุกครั้งที่มีการขอ OTP)
+  await purgeOldOtpChallenges().catch((e) => console.error("[OTP] purge error:", e));
+
   // 1. Rate limit ต่ออีเมล + purpose (กันยิงเมลถล่ม / เปลือง quota Gmail)
   const [last] = await db
     .select({ created_at: otpChallenges.created_at })
@@ -322,7 +325,10 @@ export const otpFailureMessage = (r: OtpVerifyResult): string => {
   }
 };
 
-/** ลบ challenge ที่หมดอายุเกิน 1 วัน (เรียกจาก cron หรือ setInterval ก็ได้) */
+/**
+ * ลบ challenge ที่หมดอายุเกิน 1 วัน (sendOTP เรียกให้อัตโนมัติทุกครั้ง)
+ * ต้องเก็บไว้อย่างน้อย 24 ชม. เพราะเพดานรายวัน (MAX_SENDS_PER_DAY) นับย้อนหลัง 24 ชม.
+ */
 export const purgeOldOtpChallenges = () =>
   db
     .delete(otpChallenges)
@@ -361,4 +367,3 @@ export const isKnownChallenge = async ({
 
   return !!row;
 };
-
