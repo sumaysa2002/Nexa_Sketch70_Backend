@@ -4,7 +4,7 @@ import { points, pointHistory, pointDataJson, users, projectMembers, projectHist
 import { db } from "../db/index.js";
 //import { sql } from "drizzle-orm";
 import { sql, eq, asc, and, getTableColumns } from "drizzle-orm";
-import { emptyToNull, toNumericOrNull, toIntOrNull } from "../helper/null.js";
+import { emptyToNull, toNumericOrNull, toIntOrNull, parseId } from "../helper/null.js";
 import type { Response } from "express";
 import multer from "multer";
 import path from "path";
@@ -268,6 +268,64 @@ async function normalizeImages(req: any, res: Response, next: any) {
 
 
 /* ============================================================
+   Idempotency (client_uuid)
+============================================================ */
+
+/// error ที่เกิดจากข้อมูลที่ client ส่งมา (ตอบ 400 ไม่ใช่ 500)
+class BadInput extends Error {}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/// ── ตรวจ client_uuid (ไม่ส่งมา = null) ──
+function parseClientUuid(value: unknown): string | null {
+  const v = emptyToNull(value);
+  if (v === undefined || v === null) return null;
+  if (typeof v !== "string" || !UUID_RE.test(v)) throw new BadInput("client_uuid ไม่ถูกต้อง");
+  return v.toLowerCase();
+}
+
+/// ── error จาก Postgres ว่าชน unique constraint ──
+function isUniqueViolation(e: any): boolean {
+  return e?.code === "23505" || e?.cause?.code === "23505";
+}
+
+/// ── ดึง point พร้อม draw/details json ──
+async function selectPointFull(executor: any, pointId: number) {
+  const [row] = await executor
+    .select({
+      ...getTableColumns(points),
+      draw_data_json:    pointDataJson.draw_data_json,
+      details_data_json: pointDataJson.details_data_json,
+    })
+    .from(points)
+    .leftJoin(pointDataJson, eq(pointDataJson.point_id, points.id))
+    .where(eq(points.id, pointId));
+  return row;
+}
+
+/// ── หา point ที่สร้างไปแล้วด้วย client_uuid เดียวกัน ─────────────
+async function findPointByClientUuid(clientUuid: string, userId: number, projectId: number) {
+  const [row] = await db
+    .select({
+      id:         points.id,
+      project_id: points.project_id,
+      creator:    pointHistory.point_user_creator,
+    })
+    .from(points)
+    .leftJoin(pointHistory, and(
+      eq(pointHistory.point_id, points.id),
+      sql`${pointHistory.point_user_creator} IS NOT NULL`,
+    ))
+    .where(eq(points.client_uuid, clientUuid))
+    .limit(1);
+
+  if (!row) return null;
+  if (row.project_id !== projectId || row.creator !== userId) return "mismatch" as const; // "mismatch" ถ้า uuid นี้เป็นของ user อื่นหรือโครงการอื่น
+  return await selectPointFull(db, row.id);
+}
+
+
+/* ============================================================
    ส่วนจัดการข้อมูล point
 ============================================================ */
 
@@ -283,10 +341,11 @@ point_task_Router.post("/create_point",
       | { [fieldname: string]: Express.Multer.File[] }
       | undefined;
 
-    // รวม path ไฟล์รูปใน temp ทั้งหมด >> เพื่อลบทิ้งถ้า error
+    // รวม path ไฟล์รูปใน temp ทั้งหมด >> เพื่อลบทิ้งถ้า error หรือเป็นหมุดซ้ำ
     const tempPaths = IMAGE_FIELDS
       .map((f) => files?.[f]?.[0]?.path)
       .filter(Boolean) as string[];
+    const cleanupTemp = () => tempPaths.forEach((p) => safeUnlink(p));
 
     try {
       const userId = req.user!;
@@ -326,20 +385,90 @@ point_task_Router.post("/create_point",
 
         draw_data_json,
         details_data_json,
+        client_uuid,
       } = req.body;
 
 
-      const projectId = parseInt(project_id);
-      if (isNaN(projectId)) {
-        for (const p of tempPaths) if (fs.existsSync(p)) fs.unlinkSync(p);
+      const projectId = parseId(project_id);
+      if (projectId === null) {
+        cleanupTemp();
         return res.status(400).json({ error: "project ID ไม่ถูกต้อง" });
       }
 
       // ตรวจสอบสิทธิ์ก่อนสร้าง point
       const hasAccess = await canEditProject(userId, projectId);
       if (!hasAccess) {
-        for (const p of tempPaths) if (fs.existsSync(p)) fs.unlinkSync(p);
+        cleanupTemp();
         return res.status(403).json({ error: "ไม่มีสิทธิ์เพิ่มข้อมูลในโครงการนี้" });
+      }
+
+      // ── ตรวจและแปลงข้อมูลก่อนเปิด transaction >> ข้อมูลผิดตอบ 400 (client จะไม่ retry ซ้ำ) ──
+      let clientUuid: string | null;
+      let values: Record<string, any>;
+      try {
+        clientUuid = parseClientUuid(client_uuid);
+
+        const pointName = typeof point_name === "string" ? point_name.trim() : "";
+        if (!pointName || pointName.length > 500) throw new BadInput("ชื่อหมุดรังวัดไม่ถูกต้อง");
+
+        values = {
+          project_id:    projectId,
+          point_name:    pointName,
+
+          northing:      toNumericOrNull(northing, "Northing"),
+          easting:       toNumericOrNull(easting, "Easting"),
+          height_m:      toNumericOrNull(height_m, "Ortho Height"),
+          ellipsoidal_m: toNumericOrNull(ellipsoidal_m, "ความสูงเหนือทรงรี"),
+          antenna_m:     toNumericOrNull(antenna_m, "Antenna Height"),
+          datum:         emptyToNull(datum),
+          utm:           emptyToNull(utm),
+          egm:           emptyToNull(egm),
+
+          survey_main:   emptyToNull(survey_main),
+          survey_sub:    emptyToNull(survey_sub),
+
+          gdop_m:        toNumericOrNull(gdop_m, "GDOP"),
+          pdop_m:        toNumericOrNull(pdop_m, "PDOP"),
+          hdop_m:        toNumericOrNull(hdop_m, "HDOP"),
+          dcq_m:         toNumericOrNull(dcq_m, "3DCQ"),
+
+          tambon:        emptyToNull(tambon),
+          amphoe:        emptyToNull(amphoe),
+          province:      emptyToNull(province),
+          point_date:    emptyToNull(point_date),
+
+          job:           emptyToNull(job),
+          gnss:          emptyToNull(gnss),
+          rf_1:          emptyToNull(rf_1),
+          distance_m_1:  toNumericOrNull(distance_m_1, "ระยะ RF1"),
+          az_1:          toIntOrNull(az_1, "AZ1"),
+          rf_2:          emptyToNull(rf_2),
+          distance_m_2:  toNumericOrNull(distance_m_2, "ระยะ RF2"),
+          az_2:          toIntOrNull(az_2, "AZ2"),
+
+          survey_technician: toIntOrNull(survey_technician, "ผู้รังวัด"),
+          survey_qc:         toIntOrNull(survey_qc, "ผู้ตรวจสอบ"),
+
+          point_note:    emptyToNull(point_note),
+
+          client_uuid:   clientUuid,
+        };
+      } catch (e) {
+        cleanupTemp();
+        return res.status(400).json({ error: (e as Error).message });
+      }
+
+      // ── เคยสร้างด้วย client_uuid นี้แล้ว >> คืนหมุดเดิม ไม่สร้างซ้ำ ──
+      if (clientUuid) {
+        const existing = await findPointByClientUuid(clientUuid, userId, projectId);
+        if (existing === "mismatch") {
+          cleanupTemp();
+          return res.status(409).json({ error: "client_uuid ซ้ำกับข้อมูลอื่น" });
+        }
+        if (existing) {
+          cleanupTemp();
+          return res.status(201).json(existing);
+        }
       }
 
       const result = await db.transaction(async (tx) => {
@@ -347,52 +476,11 @@ point_task_Router.post("/create_point",
         // ── 1. Insert points (ยังไม่มีชื่อรูป) ───────────────
         const [newPoint] = await tx
           .insert(points)
-          .values({
-            project_id:    parseInt(project_id),
-            point_name,
-
-            northing:      toNumericOrNull(northing, "Northing"),
-            easting:       toNumericOrNull(easting, "Easting"),
-            height_m:      toNumericOrNull(height_m, "Ortho Height"),
-            ellipsoidal_m: toNumericOrNull(ellipsoidal_m, "ความสูงเหนือทรงรี"),
-            antenna_m:     toNumericOrNull(antenna_m, "Antenna Height"),
-            datum:         emptyToNull(datum),
-            utm:           emptyToNull(utm),
-            egm:           emptyToNull(egm),
-
-            survey_main:   emptyToNull(survey_main),
-            survey_sub:    emptyToNull(survey_sub),
-
-            gdop_m:        toNumericOrNull(gdop_m, "GDOP"),
-            pdop_m:        toNumericOrNull(pdop_m, "PDOP"),
-            hdop_m:        toNumericOrNull(hdop_m, "HDOP"),
-            dcq_m:         toNumericOrNull(dcq_m, "3DCQ"),
-
-            tambon:        emptyToNull(tambon),
-            amphoe:        emptyToNull(amphoe),
-            province:      emptyToNull(province),
-            point_date:    emptyToNull(point_date),
-
-            job:           emptyToNull(job),
-            gnss:          emptyToNull(gnss),
-            rf_1:          emptyToNull(rf_1),
-            distance_m_1:  toNumericOrNull(distance_m_1, "ระยะ RF1"),
-            az_1:          toIntOrNull(az_1, "AZ1"),
-            rf_2:          emptyToNull(rf_2),
-            distance_m_2:  toNumericOrNull(distance_m_2, "ระยะ RF2"),
-            az_2:          toIntOrNull(az_2, "AZ2"),
-
-            survey_technician: toIntOrNull(survey_technician, "ผู้รังวัด"),
-            survey_qc:         toIntOrNull(survey_qc, "ผู้ตรวจสอบ"),
-
-            point_note:    emptyToNull(point_note),
-            
-          })
+          .values(values as any)
           .returning();
 
         if (!newPoint) throw new Error("สร้างหมุดรังวัดไม่สำเร็จ");
 
-        const projectId  = parseInt(project_id);
         const pointId = newPoint.id;
         const time   = Date.now();
 
@@ -450,27 +538,26 @@ point_task_Router.post("/create_point",
         });
 
         // ── 7. ดึงข้อมูลล่าสุด ────────────────────────────────
-        const [updatedPoint] = await tx
-          .select({
-            ...getTableColumns(points),
-            draw_data_json:    pointDataJson.draw_data_json,
-            details_data_json: pointDataJson.details_data_json,
-          })
-          .from(points)
-          .leftJoin(pointDataJson, eq(pointDataJson.point_id, points.id))
-          .where(eq(points.id, pointId));
-
-        return updatedPoint;
-        
+        return await selectPointFull(tx, pointId);
       });
 
       res.status(201).json(result);
 
     } catch (e) {
-      console.error("[POST /create_point] error:", e);
-      for (const p of tempPaths) {
-        if (fs.existsSync(p)) fs.unlinkSync(p);
+      cleanupTemp();
+
+      // request ซ้ำมาพร้อมกัน 2 ตัว >> คืนหมุดที่อีกตัวสร้างไว้
+      if (isUniqueViolation(e) && req.body?.client_uuid) {
+        try {
+          const projectId = parseId(req.body.project_id);
+          const existing = projectId === null ? null : await findPointByClientUuid(
+            String(req.body.client_uuid).toLowerCase(), req.user!, projectId,
+          );
+          if (existing && existing !== "mismatch") return res.status(201).json(existing);
+        } catch (_) {}
       }
+
+      console.error("[POST /create_point] error:", e);
       res.status(500).json({ error: "สร้างหมุดรังวัดไม่สำเร็จ" });
     }
   }
@@ -482,9 +569,9 @@ point_task_Router.get("/points/:project_id",
   auth,
   async (req: AuthRequest, res: Response) => {
     try {
-      const projectId = parseInt(req.params["project_id"] as string);
+      const projectId = parseId(req.params["project_id"]);
 
-      if (isNaN(projectId)) {
+      if (projectId === null) {
         res.status(400).json({ error: "Project ID ไม่ถูกต้อง" });
         return;
       }
@@ -534,9 +621,9 @@ point_task_Router.put("/update_point/:point_id",
 
     try {
       const userId  = req.user!;
-      const pointId = parseInt(req.params["point_id"] as string);
+      const pointId = parseId(req.params["point_id"]);
 
-      if (isNaN(pointId)) {
+      if (pointId === null) {
         res.status(400).json({ error: "point ID ไม่ถูกต้อง" });
         return;
       }
@@ -760,9 +847,9 @@ point_task_Router.delete("/delete_point/:point_id",
   async (req: AuthRequest, res: Response) => {
     try {
       const userId  = req.user!;
-      const pointId = parseInt(req.params["point_id"] as string);
+      const pointId = parseId(req.params["point_id"]);
 
-      if (isNaN(pointId)) {
+      if (pointId === null) {
         res.status(400).json({ error: "point ID ไม่ถูกต้อง" });
         return;
       }
@@ -821,26 +908,29 @@ point_task_Router.delete("/delete_point/:point_id",
 
 
 
-/// ── ส่งไฟล์รูปของ Point (ต้อง login + มีสิทธิ์เข้าถึงโครงการ) ──────────────
+/* ============================================================
+   ส่งไฟล์รูปของ Point (ต้อง login + มีสิทธิ์เข้าถึงโครงการ) 
+============================================================ */
 const POINT_UPLOAD_ROOT = path.resolve("uploads", "point");
 
 point_task_Router.get("/image/:project_id/:point_id/:filename",
   auth,
   async (req: AuthRequest, res: Response) => {
     try {
-      const projectId = parseInt(req.params["project_id"] as string);
-      const pointId   = parseInt(req.params["point_id"] as string);
+      const projectId = parseId(req.params["project_id"]);
+      const pointId   = parseId(req.params["point_id"]);
       const filename  = String(req.params["filename"] ?? "");
 
-      if (isNaN(projectId) || isNaN(pointId) || !filename) {
-        res.status(400).json({ error: "คำขอไม่ถูกต้อง" });
+      // id ผิดรูปแบบ (เช่น id ติดลบของหมุด offline) >> ไม่มีรูปนี้บน server
+      if (projectId === null || pointId === null || !filename) {
+        res.status(404).json({ error: "ไม่พบรูปภาพ" });
         return;
       }
 
       // ตรวจสิทธิ์
       const hasAccess = await canViewProject(req.user!, projectId);
       if (!hasAccess) {
-        res.status(403).json({ error: "ไม่มีสิทธิ์เข้าถึงข้อมูลในโครงการ" });
+        res.status(403).json({ error: "ไม่มีสิทธิ์เข้าถึงข้อมูลโครงการ" });
         return;
       }
 

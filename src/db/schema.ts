@@ -6,7 +6,8 @@ import {
   numeric,
   timestamp,
   date,
-  index
+  index,
+  uuid
 } from "drizzle-orm/pg-core";
 
 /* =======================
@@ -121,6 +122,8 @@ export const projects = pgTable("projects", {
 
   project_note:      text("project_note"),               // หมายเหตุ
 
+  client_uuid:       uuid("client_uuid").unique(),       // idempotency key จาก client (กันโครงการซ้ำตอน sync)
+
 });
 
 /* =======================
@@ -233,6 +236,8 @@ export const points = pgTable("points", {
   survey_qc:         integer("survey_qc"),                                      // users.id
 
   point_note:      text("point_note"),
+
+  client_uuid:     uuid("client_uuid").unique(),                                // idempotency key จาก client (กันหมุดซ้ำตอน sync)
 
 });
 

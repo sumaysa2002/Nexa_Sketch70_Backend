@@ -58,3 +58,25 @@ export const auth = async (
     res.status(401).json({ error: "Token ไม่ถูกต้องหรือหมดอายุ" });
   }
 };
+
+/// ── ตรวจสอบสถานะว่าต้องเป็น admin เท่านั้น ────────────────────────────
+export const requireAdmin = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    const [u] = await db
+      .select({ status: users.status })
+      .from(users)
+      .where(eq(users.id, req.user!));
+
+    if (u?.status !== "admin") {
+      res.status(403).json({ error: "เฉพาะผู้ดูแลระบบเท่านั้น" });
+      return;
+    }
+    next();
+  } catch (e) {
+    res.status(500).json({ error: "ตรวจสอบสิทธิ์ไม่สำเร็จ" });
+  }
+};

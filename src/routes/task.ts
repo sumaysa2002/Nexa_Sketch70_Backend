@@ -1,19 +1,19 @@
 import { Router } from "express";
-import { auth, type AuthRequest } from "../middleware/auth.js";
+import { auth, requireAdmin, type AuthRequest } from "../middleware/auth.js";
 import { projects, projectMembers, projectHistory, users, points, pointHistory } from "../db/schema.js";
-import type { NewProject } from "../db/schema.js";
+import type { NewProject, Project } from "../db/schema.js";
 import { db } from "../db/index.js";
 import { sql } from "drizzle-orm";
 import type { Request, Response } from "express";
-import { eq, asc, desc, and} from "drizzle-orm";
-import { emptyToNull, toNumericOrNull, toIntOrNull } from "../helper/null.js";
+import { eq, asc, desc, and, inArray} from "drizzle-orm";
+import { emptyToNull, toNumericOrNull, toIntOrNull, parseId } from "../helper/null.js";
 import path from "path";
 import fs from "fs";
 
 
 const taskRouter = Router();
 
-/// ─── หา admin ที่เป็นผู้สร้างโครงการ (จาก project_history) ──────────
+/// ─── หา admin ที่เป็นผู้สร้างโครงการ ──────────
 async function getProjectCreatorId(projectId: number): Promise<number | null> {
   const [row] = await db
     .select({ project_user_creator: projectHistory.project_user_creator })
@@ -32,79 +32,163 @@ async function getProjectCreatorId(projectId: number): Promise<number | null> {
 
 
 /* ============================================================
-   ส่วนจัดการข้อมูล Project
+   ตรวจสอบข้อมูลโครงการ
 ============================================================ */
 
-/// ── สร้างโครงการใหม่ (admin เท่านั้นที่สร้างได้) ──────────────────────────────────────
-taskRouter.post("/create_project", auth, async (req: AuthRequest, res: Response) => {
-  try {
+/// error ที่เกิดจากข้อมูลที่ client ส่งมา (ตอบ 400)
+class BadInput extends Error {}
 
-    // id ของ user ที่ login
-    const userId = req.user!;
+/// ตรวจและทำความสะอาดข้อมูลโครงการ (create_project และ sync_projects)
+function cleanProjectInput(p: any) {
+  if (!p || typeof p !== "object") throw new BadInput("ข้อมูลโครงการไม่ถูกต้อง");
 
-    // ตรวจสอบว่าเป็น admin
-    const [currentUser] = await db
-      .select({ id: users.id, status: users.status })
-      .from(users)
-      .where(eq(users.id, userId));
+  const projectName = typeof p.project_name === "string" ? p.project_name.trim() : "";
+  if (!projectName || projectName.length > 500) throw new BadInput("ชื่อโครงการไม่ถูกต้อง");
 
-    if (!currentUser || currentUser.status !== "admin") {
-      return res.status(403).json({ error: "เฉพาะผู้ดูแลระบบเท่านั้นที่สามารถสร้างโครงการได้" });
+  const text = (v: unknown, field: string, max = 5000) => {
+    const r = emptyToNull(v);
+    if (r === undefined || r === null) return r;
+    if (typeof r !== "string" || r.length > max) throw new BadInput(`ข้อมูลฟิลด์ "${field}" ไม่ถูกต้อง`);
+    return r;
+  };
+
+  const date = (v: unknown, field: string) => {
+    const r = text(v, field, 50);
+    if (typeof r === "string" && Number.isNaN(Date.parse(r))) {
+      throw new BadInput(`ข้อมูลฟิลด์ "${field}" ไม่ใช่รูปแบบวันที่`);
     }
+    return r;
+  };
 
-    // ข้อมูล project จาก Flutter
-    const {
-      name_project_id,
-      project_name,
-      project_details,
-      province,
-      sensor,
-      gsd_num,
-      gsd_unit,
-      survey_main,
-      survey_sub,
-      project_start_date,
-      project_end_date,
-      project_note,
-      member_ids, // array ของ user_id เช่น [2, 5, 7]
-    } = req.body;
+  let gsdNum: number | null;
+  try {
+    gsdNum = toIntOrNull(p.gsd_num, "GSD");
+  } catch (e) {
+    throw new BadInput((e as Error).message);
+  }
 
-    const result = await db.transaction(async (tx) => {
+  return {
+    name_project_id:    text(p.name_project_id, "name_project_id", 200),
+    project_name:       projectName,
+    project_details:    text(p.project_details, "project_details"),
+    province:           text(p.province, "province", 1000),
 
-      // Insert ตาราง projects
+    sensor:             text(p.sensor, "sensor", 200),
+    gsd_num:            gsdNum,
+    gsd_unit:           text(p.gsd_unit, "gsd_unit", 50),
+
+    survey_main:        text(p.survey_main, "survey_main", 200),
+    survey_sub:         text(p.survey_sub, "survey_sub", 200),
+
+    project_start_date: date(p.project_start_date, "project_start_date"),
+    project_end_date:   date(p.project_end_date, "project_end_date"),
+
+    project_note:       text(p.project_note, "project_note"),
+  };
+}
+
+/// สมาชิกที่เพิ่มได้ต้องเป็น user ที่อยู่ในกลุ่มของ admin เท่านั้น
+async function filterMemberIds(adminId: number, raw: unknown, strict: boolean): Promise<number[]> {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw) || raw.length > 500) throw new BadInput("สมาชิกไม่ถูกต้อง");
+
+  const ids = [...new Set(raw.map(Number))];
+  if (strict && ids.some((n) => !Number.isInteger(n) || n <= 0)) {
+    throw new BadInput("สมาชิกไม่ถูกต้อง");
+  }
+  const clean = ids.filter((n) => Number.isInteger(n) && n > 0);
+  if (clean.length === 0) return [];
+
+  // admin เจ้าของโครงการเลือกตัวเองเป็นสมาชิกได้
+  const includeSelf = clean.includes(adminId);
+  const others = clean.filter((n) => n !== adminId);
+
+  // สมาชิกคนอื่นต้องเป็น user ที่อยู่ในกลุ่มของ admin
+  const rows = others.length === 0 ? [] : await db
+    .select({ id: users.id })
+    .from(users)
+    .where(
+      and(
+        inArray(users.id, others),
+        eq(users.admin, String(adminId)),
+        eq(users.status, "user")
+      )
+    );
+
+  const valid = [...(includeSelf ? [adminId] : []), ...rows.map((r) => r.id)];
+  if (strict && valid.length !== ids.length) {
+    throw new BadInput("มีสมาชิกที่คุณไม่ได้อนุมัติสมาชิก");
+  }
+  return valid;
+}
+
+
+/* ============================================================
+   Idempotency (client_uuid)
+============================================================ */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/// ── ตรวจ client_uuid (ไม่ส่งมา = null) ──
+function parseClientUuid(value: unknown): string | null {
+  const v = emptyToNull(value);
+  if (v === undefined || v === null) return null;
+  if (typeof v !== "string" || !UUID_RE.test(v)) throw new BadInput("client_uuid ไม่ถูกต้อง");
+  return v.toLowerCase();
+}
+
+/// ── error จาก Postgres ว่าชน unique constraint ──
+function isUniqueViolation(e: any): boolean {
+  return e?.code === "23505" || e?.cause?.code === "23505";
+}
+
+/// ── หาโครงการที่สร้างไปแล้วด้วย client_uuid เดียวกัน ─────────────
+async function findProjectByClientUuid(clientUuid: string, userId: number) {
+  const [row] = await db
+    .select()
+    .from(projects)
+    .where(eq(projects.client_uuid, clientUuid))
+    .limit(1);
+
+  if (!row) return null;
+  const creatorId = await getProjectCreatorId(row.id);
+  if (creatorId !== userId) return "mismatch" as const; // "mismatch" ถ้า uuid นี้เป็นของ admin คนอื่น
+  return row;
+}
+
+/// ── สร้างโครงการ 1 รายการ (create_project และ sync_projects) ถ้าเคยสร้างด้วย client_uuid นี้แล้ว >> คืนโครงการเดิม ไม่สร้างซ้ำ ─────────────
+async function createProjectIdempotent(
+  userId: number,
+  input: ReturnType<typeof cleanProjectInput>,
+  memberIds: number[],
+  clientUuid: string | null,
+): Promise<{ project: Project; existed: boolean }> {
+
+  if (clientUuid) {
+    const existing = await findProjectByClientUuid(clientUuid, userId);
+    if (existing === "mismatch") throw new BadInput("client_uuid ซ้ำกับข้อมูลอื่น");
+    if (existing) return { project: existing, existed: true };
+  }
+
+  try {
+    const project = await db.transaction(async (tx) => {
       const [newProject] = await tx
         .insert(projects)
-        .values({
-          name_project_id:     emptyToNull(name_project_id),
-          project_name,
-          project_details:     emptyToNull(project_details),
-          province:            emptyToNull(province),
-          sensor:              emptyToNull(sensor),
-          gsd_num:             toIntOrNull(gsd_num, "GSD"),
-          gsd_unit:            emptyToNull(gsd_unit),
-          survey_main:         emptyToNull(survey_main),
-          survey_sub:          emptyToNull(survey_sub),
-          project_start_date:  emptyToNull(project_start_date),
-          project_end_date:    emptyToNull(project_end_date),
-          project_note:        emptyToNull(project_note),
-        } satisfies Partial<NewProject>)
+        .values({ ...input, client_uuid: clientUuid } satisfies Partial<NewProject>)
         .returning();
 
       if (!newProject) throw new Error("สร้างโครงการไม่สำเร็จ");
 
-      // Insert ตาราง project_history
       await tx.insert(projectHistory).values({
         project_id:           newProject.id,
         project_user_creator: userId,
         project_time_created: sql`now()`,
       });
 
-      // Insert ตาราง project_members (ถ้ามีสมาชิกในโครงการ)
-      if (Array.isArray(member_ids) && member_ids.length > 0) {
+      if (memberIds.length > 0) {
         await tx.insert(projectMembers).values(
-          member_ids.map((uid: number) => ({
-            project_id:  newProject.id,
-            user_id:     uid,
+          memberIds.map((uid) => ({
+            project_id:       newProject.id,
+            user_id:          uid,
             time_add_members: sql`now()`,
           }))
         );
@@ -112,13 +196,44 @@ taskRouter.post("/create_project", auth, async (req: AuthRequest, res: Response)
 
       return newProject;
     });
+    return { project, existed: false };
 
-    res.status(201).json(result);
   } catch (e) {
+    // request ซ้ำมาพร้อมกัน >> อีกตัวสร้างไปแล้ว >> คืนตัวนั้น
+    if (clientUuid && isUniqueViolation(e)) {
+      const existing = await findProjectByClientUuid(clientUuid, userId);
+      if (existing && existing !== "mismatch") return { project: existing, existed: true };
+    }
+    throw e;
+  }
+}
+
+
+
+
+/* ============================================================
+   ส่วนจัดการข้อมูล Project
+============================================================ */
+
+/// ── สร้างโครงการใหม่ (admin เท่านั้นที่สร้างได้) ──────────────────────────────────────
+taskRouter.post("/create_project", auth, requireAdmin, async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user!;
+
+    const input      = cleanProjectInput(req.body);
+    const clientUuid = parseClientUuid(req.body.client_uuid);
+    const memberIds  = await filterMemberIds(userId, req.body.member_ids, true);
+
+    const { project } = await createProjectIdempotent(userId, input, memberIds, clientUuid);
+
+    res.status(201).json(project);
+  } catch (e) {
+    if (e instanceof BadInput) return res.status(400).json({ error: e.message });
     console.error("[POST /create_project] error:", e);
     res.status(500).json({ error: "สร้างโครงการไม่สำเร็จ" });
   }
 });
+
 
 
 /// ── ดึงโครงการทั้งหมด แยกตาม Admin (เรียงจากใหม่ >> เก่า) ────────────────────────────
@@ -241,9 +356,9 @@ taskRouter.get("/projects", auth, async (req: AuthRequest, res: Response) => {
 taskRouter.put("/update_project/:id", auth, async (req: AuthRequest, res: Response) => {
   try {
     const userId   = req.user!;
-    const projectId = parseInt(req.params.id as string);
+    const projectId = parseId(req.params.id);
 
-    if (isNaN(projectId)) {
+    if (projectId === null) {
       return res.status(400).json({ error: "projectId ไม่ถูกต้อง" });
     }
 
@@ -355,9 +470,9 @@ taskRouter.put("/update_project/:id", auth, async (req: AuthRequest, res: Respon
 taskRouter.delete("/delete_project/:id", auth, async (req: AuthRequest, res: Response) => {
   try {
     const userId    = req.user!;
-    const projectId = parseInt(req.params.id as string);
+    const projectId = parseId(req.params.id);
 
-    if (isNaN(projectId)) {
+    if (projectId === null) {
       return res.status(400).json({ error: "projectId ไม่ถูกต้อง" });
     }
 
@@ -435,64 +550,81 @@ taskRouter.delete("/delete_project/:id", auth, async (req: AuthRequest, res: Res
 
 
 /// ── sync โครงการที่สร้างขณะ offline ขึ้น server ────────────────────────────
-taskRouter.post("/sync_projects", auth, async (req: AuthRequest, res: Response) => {
+taskRouter.post("/sync_projects", auth, requireAdmin, async (req: AuthRequest, res: Response) => {
   try {
     const userId = req.user!;
-    const projectsList = req.body; // โครงการที่ยังไม่ได้ sync (array)
+    const list   = req.body;
 
-    const syncedProjects = [];
-
-    for (const p of projectsList) {
-      const result = await db.transaction(async (tx) => {
-
-        // Insert ตาราง projects
-        const [newProject] = await tx
-          .insert(projects)
-          .values({
-            name_project_id:    p.name_project_id,
-            project_name:       p.project_name,
-            project_details:    p.project_details,
-            province:           p.province,
-            sensor:             p.sensor,
-            gsd_num:            p.gsd_num,
-            gsd_unit:           p.gsd_unit,
-            survey_main:        p.survey_main,
-            survey_sub:         p.survey_sub,
-            project_start_date: p.project_start_date,
-            project_end_date:   p.project_end_date,
-            project_note:       p.project_note,
-          } satisfies Partial<NewProject>)
-          .returning();
-
-        if (!newProject) throw new Error("sync โครงการไม่สำเร็จ");
-
-        // Insert ตาราง project_history
-        await tx.insert(projectHistory).values({
-          project_id:           newProject.id,
-          project_user_creator: userId,
-          project_time_created: sql`now()`,
-        });
-
-        // Insert ตาราง project_members (ถ้ามีสมาชิกในโครงการ)
-        const memberIds = Array.isArray(p.member_ids) ? p.member_ids : [];
-        if (memberIds.length > 0) {
-          await tx.insert(projectMembers).values(
-            memberIds.map((uid: number) => ({
-              project_id:   newProject.id,
-              user_id:      uid,
-              time_add_members: sql`now()`,
-            }))
-          );
-        }
-
-        return newProject;
-      });
-
-      syncedProjects.push(result);
+    if (!Array.isArray(list) || list.length > 50) {
+      return res.status(400).json({ error: "ข้อมูลที่ส่งมาไม่ถูกต้อง" });
     }
 
-    res.status(201).json(syncedProjects);
+    // ── client รุ่นเก่า (ไม่ส่ง client_uuid)
+    if (list.every((p: any) => !p?.client_uuid)) {
+      const prepared: { input: ReturnType<typeof cleanProjectInput>; memberIds: number[] }[] = [];
+      for (const p of list) {
+        prepared.push({
+          input:     cleanProjectInput(p),
+          memberIds: await filterMemberIds(userId, p?.member_ids, false),
+        });
+      }
+
+      const legacy = await db.transaction(async (tx) => {
+        const out = [];
+        for (const { input, memberIds } of prepared) {
+          const [newProject] = await tx
+            .insert(projects)
+            .values(input satisfies Partial<NewProject>)
+            .returning();
+          if (!newProject) throw new Error("sync โครงการไม่สำเร็จ");
+
+          await tx.insert(projectHistory).values({
+            project_id:           newProject.id,
+            project_user_creator: userId,
+            project_time_created: sql`now()`,
+          });
+
+          if (memberIds.length > 0) {
+            await tx.insert(projectMembers).values(
+              memberIds.map((uid) => ({
+                project_id:       newProject.id,
+                user_id:          uid,
+                time_add_members: sql`now()`,
+              }))
+            );
+          }
+          out.push(newProject);
+        }
+        return out;
+      });
+
+      return res.status(201).json(legacy);
+    }
+
+    const results = [];
+
+    for (const p of list) {
+      const rawUuid = typeof p?.client_uuid === "string" ? p.client_uuid : null;
+      try {
+        const input      = cleanProjectInput(p);
+        const clientUuid = parseClientUuid(p?.client_uuid);
+        const memberIds  = await filterMemberIds(userId, p?.member_ids, false);
+
+        const { project, existed } = await createProjectIdempotent(userId, input, memberIds, clientUuid);
+        results.push({ client_uuid: rawUuid, status: existed ? "exists" : "created", project });
+
+      } catch (e) {
+        if (e instanceof BadInput) {
+          results.push({ client_uuid: rawUuid, status: "error", error: e.message });
+          continue;
+        }
+        throw e;
+      }
+    }
+
+    res.status(200).json({ results });
   } catch (e) {
+    if (e instanceof BadInput) return res.status(400).json({ error: e.message });
     console.error("[POST /sync_projects] error:", e);
     res.status(500).json({ error: "sync โครงการไม่สำเร็จ" });
   }

@@ -2,6 +2,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 import express from "express";
+import { faultRouter, faultInjector }  from "./middleware/fault.js"
 import { purgeOldOtpChallenges } from "./services/otp.service.js";
 import authRouter from "./routes/auth.js";
 import taskRouter from "./routes/task.js"
@@ -11,6 +12,15 @@ import point_task_Router from "./routes/point_task.js"
 const app = express();
 
 app.use(express.json());
+
+// เครื่องมือจำลอง error สำหรับทดสอบ sync >> เปิดเฉพาะเมื่อตั้ง ENABLE_FAULT_INJECTION=true เอง
+if (process.env.ENABLE_FAULT_INJECTION === "true") {
+  console.warn("[WARN] Fault injection ENABLED — ห้ามเปิดบน production");
+  app.use(faultRouter);
+  app.use(faultInjector);
+}
+
+
 app.use("/auth" , authRouter);
 app.use("/tasks" , taskRouter);
 app.use("/point_tasks" , point_task_Router);

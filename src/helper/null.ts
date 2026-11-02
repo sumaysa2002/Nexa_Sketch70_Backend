@@ -35,3 +35,12 @@ export function toIntOrNull(value: any, fieldName: string): number | null {
   }
   return parseInt(trimmed, 10);
 }
+
+// ─── id จาก URL / body (กัน id ติดลบของข้อมูล offline) ────────────────────────
+export function parseId(value: unknown): number | null {
+  if (typeof value !== "string" && typeof value !== "number") return null;
+  const str = String(value).trim();
+  if (!/^\d{1,10}$/.test(str)) return null;
+  const n = Number(str);
+  return n >= 1 && n <= 2_147_483_647 ? n : null;
+}

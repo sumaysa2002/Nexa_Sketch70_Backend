@@ -2,10 +2,10 @@ import type { Request, Response } from "express"; // เพื่อให้ Ty
 import { Router } from "express";
 import { db } from "../db/index.js"; // ตัวเชื่อม Drizzle  ↔ PostgreSQL
 import { users, usersHistory } from "../db/schema.js";
-import { eq, ne, and, or, sql, asc, inArray } from "drizzle-orm"; // ฟังก์ชันช่วยเขียน WHERE email = ?   เพิ่ม sql 
+import { eq, ne, and, or, sql, asc, inArray, isNull } from "drizzle-orm"; // ฟังก์ชันช่วยเขียน WHERE email = ?   เพิ่ม sql 
 import bcryptjs from "bcryptjs"; // ใช้ hash password
 import jwt from "jsonwebtoken";
-import { auth, type AuthRequest } from "../middleware/auth.js"; // ใช้ตรวจสอบ JWT token ก่อนเข้าถึง route ที่ต้อง login
+import { auth, requireAdmin, type AuthRequest } from "../middleware/auth.js"; // ใช้ตรวจสอบ JWT token ก่อนเข้าถึง route ที่ต้อง login
 import {
   sendOTP,
   verifyOTP,
@@ -394,7 +394,6 @@ authRouter.post("/login", async (req: Request, res: Response) => {
     const { hash, refCode } = await sendOTP({ email: existingUser.email, purpose: "login" });
 
     // ก่อนยืนยัน OTP ส่งกลับแค่ email เท่านั้น
-    // (ข้อมูลผู้ใช้ทั้งหมดจะได้หลังยืนยัน OTP ผ่านใน /login/verify_otp)
     res.json({
       message: "OTP sent to email",
       hash,
@@ -476,9 +475,7 @@ authRouter.post("/login/reset_password/send_otp", async (req: Request, res: Resp
       .from(users)
       .where(eq(users.email, email));
 
-    // ไม่พบอีเมล → สร้าง challenge จริงแต่ไม่ส่งเมล
-    // ทำให้ response, rate limit และผลตอนกรอกรหัส (นับครั้ง/ล็อก) เหมือนกรณีปกติทุกอย่าง
-    // จึงใช้หน้านี้เดาไม่ได้ว่าอีเมลนี้มีในระบบหรือไม่
+    // ไม่พบอีเมล >> สร้าง challenge จริงแต่ไม่ส่งเมล จึงใช้หน้านี้เดาไม่ได้ว่าอีเมลนี้มีในระบบหรือไม่
     const { hash, refCode } = await sendOTP({
       email: existingUser?.email ?? email,
       purpose: "reset_password",
@@ -888,18 +885,18 @@ authRouter.get("/users_by_ids", auth, async (req: AuthRequest, res: Response) =>
     res.status(200).json(foundUsers);
   } catch (e) {
     console.error("[GET /users_by_ids] error:", e);
-    res.status(500).json({ error: "ไม่สามารถดึงข้อมูลสมาชิกได้" });
+    res.status(500).json({ error: "ไม่สามารถเรียกข้อมูลสมาชิกได้" });
   }
 });
 
 
 // ── สำหรับ admin >> ค้นหา user ที่ยังไม่ได้รับการอนุมัติ ──────────────────
-authRouter.get("/search_users", auth, async (req: AuthRequest, res: Response) => {
+authRouter.get("/search_users", auth, requireAdmin, async (req: AuthRequest, res: Response) => {
   try {
     const adminId = req.user!;
     const query   = (req.query["q"] as string ?? "").toLowerCase().trim();
 
-    // ดึง user ที่มีค่า admin = null หรืออยู่กลุ่มอื่น
+    // เฉพาะผู้ที่ยังไม่สังกัดกลุ่มใดและยังไม่ได้รับอนุมัติ
     const allUsers = await db
       .select({
         id: users.id,
@@ -915,19 +912,17 @@ authRouter.get("/search_users", auth, async (req: AuthRequest, res: Response) =>
         job_level: users.job_level,
         job_office: users.job_office,
         job_department: users.job_department,
-
-        admin: users.admin,
-        status: users.status,
       })
       .from(users)
       .where(
         and(
-          sql`${users.status} IS DISTINCT FROM 'admin'`,
-          ne(users.id, adminId),
-          sql`${users.admin} IS DISTINCT FROM ${String(adminId)}`
+          sql`${users.admin} IS NULL`,
+          sql`${users.status} IS NULL`,
+          ne(users.id, adminId)
         )
       )
-      .orderBy(asc(users.email));
+      .orderBy(asc(users.email))
+      .limit(200);
 
     // กรองตาม query (first_name, last_name, email)
     const filtered = query
@@ -951,8 +946,14 @@ authRouter.put("/approved_user/:userId", auth, async (req: AuthRequest, res: Res
     const adminId = req.user!;
     const userId  = parseInt(req.params["userId"] as string);
 
-    if (isNaN(userId)) {
+    if (isNaN(userId) || userId <= 0) {
       res.status(400).json({ error: "userId ไม่ถูกต้อง" });
+      return;
+    }
+
+    // อนุมัติตัวเองไม่ได้ (ป้องกัน admin เปลี่ยนสถานะตัวเองเป็น user)
+    if (userId === adminId) {
+      res.status(400).json({ error: "ไม่สามารถอนุมัติบัญชีของตัวเองได้" });
       return;
     }
 
@@ -967,9 +968,9 @@ authRouter.put("/approved_user/:userId", auth, async (req: AuthRequest, res: Res
       return;
     }
 
-    // คอลั่ม admin ต้องเป็น null
+    // เป้าหมายต้องยังไม่สังกัดกลุ่ม (admin = null) และยังไม่มีสถานะ (status = null)
     const [target] = await db
-      .select({ id: users.id, admin: users.admin })
+      .select({ id: users.id, admin: users.admin, status: users.status })
       .from(users)
       .where(eq(users.id, userId));
 
@@ -978,7 +979,12 @@ authRouter.put("/approved_user/:userId", auth, async (req: AuthRequest, res: Res
       return;
     }
 
-    if (target.admin !== null) {
+    if (target.status === "admin") {
+      res.status(403).json({ error: "ไม่สามารถอนุมัติบัญชีผู้ดูแลระบบได้" });
+      return;
+    }
+
+    if (target.admin !== null || target.status !== null) {
       res.status(409).json({ error: "สมาชิกผ่านการอนุมัติหรือสังกัดกลุ่มอื่นแล้ว" });
       return;
     }
@@ -992,7 +998,12 @@ authRouter.put("/approved_user/:userId", auth, async (req: AuthRequest, res: Res
           admin:  String(adminId),
           status: "user",
         })
-        .where(and(eq(users.id, userId), sql`${users.admin} IS NULL`))
+        .where(and(
+          eq(users.id, userId),
+          isNull(users.admin),
+          isNull(users.status),
+          ne(users.id, adminId),
+        ))
         .returning({ id: users.id });
 
       if (!updated) {
@@ -1009,6 +1020,11 @@ authRouter.put("/approved_user/:userId", auth, async (req: AuthRequest, res: Res
 
     res.status(200).json({ message: "อนุมัติสมาชิกสำเร็จ" });
   } catch (e) {
+    // สถานะเป้าหมายเปลี่ยนระหว่างตรวจกับ update (เช่น admin อีกคนอนุมัติไปก่อน)
+    if (e instanceof Error && e.message === "สมาชิกผ่านการอนุมัติหรือสังกัดกลุ่มอื่นแล้ว") {
+      res.status(409).json({ error: e.message });
+      return;
+    }
     console.error("[PUT /approved_user] error:", e);
     res.status(500).json({ error: "อนุมัติสมาชิกไม่สำเร็จ" });
   }
@@ -1141,6 +1157,7 @@ async function canViewSignature(viewerId: number, ownerId: number): Promise<bool
   return !!row;
 }
 
+
 /// ── รูปโปรไฟล์: ผู้ใช้ที่ login ─────────────────────────────
 authRouter.get("/image/profile/:filename", auth, async (req: AuthRequest, res: Response) => {
   try {
@@ -1168,6 +1185,7 @@ authRouter.get("/image/profile/:filename", auth, async (req: AuthRequest, res: R
     if (!res.headersSent) res.status(500).json({ error: "ดึงข้อมูลรูปภาพไม่สำเร็จ" });
   }
 });
+
 
 /// ── ลายเซ็น: user หรือคนในกลุ่ม admin เดียวกัน ─────────────────
 authRouter.get("/image/signature/:filename", auth, async (req: AuthRequest, res: Response) => {
