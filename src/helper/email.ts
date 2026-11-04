@@ -22,6 +22,5 @@ export function parseEmail(value: unknown): string | null {
 }
 
 /// เงื่อนไข WHERE lower(users.email) = email (ใช้ unique index users_email_lower_idx)
-/// ใส่ lower() ฝั่ง DB ด้วย เผื่อมีข้อมูลเก่าที่ยังไม่ได้แปลงเป็นตัวพิมพ์เล็ก
 export const userEmailEquals = (email: string): SQL =>
   sql`lower(${users.email}) = ${normalizeEmail(email)}`;
