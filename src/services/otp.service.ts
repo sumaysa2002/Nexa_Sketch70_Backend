@@ -3,6 +3,7 @@ import { and, asc, desc, eq, gt, gte, isNull, lt, max, sql } from "drizzle-orm";
 import { db } from "../db/index.js";
 import { otpChallenges } from "../db/schema.js";
 import { sendOTPEmail } from "./emailer.service.js";
+import { normalizeEmail } from "../helper/email.js";
 
 /* ============================================================
    CONFIG
@@ -39,7 +40,6 @@ export class OtpError extends Error {
 /* ============================================================
    HELPERS
 ============================================================ */
-const normalizeEmail = (email: string) => email.trim().toLowerCase();
 
 // ผูก OTP เข้ากับ challenge id + email + purpose → เอา OTP ไปใช้ข้าม flow ไม่ได้
 const hmacOtp = (id: string, email: string, purpose: OtpPurpose, otp: string) =>

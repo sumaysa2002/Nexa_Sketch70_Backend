@@ -7,8 +7,10 @@ import {
   timestamp,
   date,
   index,
+  uniqueIndex,
   uuid
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 
 /* =======================
    USERS TABLE
@@ -35,7 +37,10 @@ export const users = pgTable("users", {
   status:         text("status"),                        // admin | user | null = ยังไม่อนุมัติจาก admin
   signature:      text("signature"),                     // userID_signature_img_{timestamp}.jpg
 
-});
+},
+// อีเมลห้ามซ้ำแบบไม่สนตัวพิมพ์เล็ก/ใหญ่ (A@x.com กับ a@x.com = คนเดียวกัน)
+(t) => [uniqueIndex("users_email_lower_idx").on(sql`lower(${t.email})`)]
+);
 
 /* =======================
    USERS HISTORY TABLE

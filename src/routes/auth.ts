@@ -16,6 +16,7 @@ import {
 } from "../services/otp.service.js";
 import crypto from "crypto";
 import { emptyToNull, toNumericOrNull, toIntOrNull } from "../helper/null.js";
+import { parseEmail, userEmailEquals } from "../helper/email.js";
 import multer from "multer";
 import path from "path";
 import fs from "fs";
@@ -35,6 +36,9 @@ function sanitizeUser<T extends { password?: unknown }>(u: T): Omit<T, "password
   const { password, ...safeUser } = u;
   return safeUser;
 }
+
+/// ─── error ค่าซ้ำจาก PostgreSQL (unique violation) ──────────
+const isUniqueViolation = (e: any): boolean => e?.code === "23505" || e?.cause?.code === "23505";
 
 /// ─── ตัวช่วยฝั่ง OTP / validation ──────────
 const MIN_PASSWORD_LENGTH = 6; // ให้ตรงกับ Flutter
@@ -192,18 +196,18 @@ const uploadFields = multer({
 /// ── เช็ค Email ซ้ำในระบบ ──────────────────────────────────────
 authRouter.post("/signup/check_email", async (req: Request, res: Response) => {
   try {
-    const { email } = req.body;
+    const email = parseEmail(req.body.email);
 
     if (!email) {
       return res.status(400).json({
-        message: "โปรดระบุอีเมล",
+        message: "รูปแบบอีเมลไม่ถูกต้อง",
       });
     }
 
     const existingUser = await db
       .select({ id: users.id })
       .from(users)
-      .where(eq(users.email, email));
+      .where(userEmailEquals(email));
 
     // มี email แล้ว
     if (existingUser.length > 0) {
@@ -227,11 +231,11 @@ authRouter.post("/signup/check_email", async (req: Request, res: Response) => {
 /// ── ส่งรหัส OTP ไปยัง email ──────────────────────────────────────
 authRouter.post("/signup/send_otp", async (req: Request, res: Response) => {
   try {
-    const { email } = req.body;
-    if (!isNonEmptyString(email)) return res.status(400).json({ message: "กรุณาระบุอีเมล" });
+    const email = parseEmail(req.body.email);
+    if (!email) return res.status(400).json({ message: "รูปแบบอีเมลไม่ถูกต้อง" });
 
     // อีเมลที่สมัครแล้ว ไม่ต้องส่ง OTP สมัครสมาชิก
-    const [existing] = await db.select({ id: users.id }).from(users).where(eq(users.email, email));
+    const [existing] = await db.select({ id: users.id }).from(users).where(userEmailEquals(email));
     if (existing) return res.status(409).json({ message: "อีเมลนี้อยู่ในระบบแล้ว" });
 
     const { hash, refCode } = await sendOTP({ email, purpose: "signup" });
@@ -284,9 +288,12 @@ authRouter.post("/signup/verify_and_register",
         // ดึง OTP และ hash
         const { otp, hash } = req.body;
 
+        // อีเมลรูปแบบมาตรฐาน (ตัวพิมพ์เล็ก ไม่มีช่องว่าง)
+        const email = parseEmail(payload?.email);
+
         // ตรวจข้อมูลจำเป็นก่อน (ยังไม่ใช้ OTP ถ้าข้อมูลไม่ครบ)
         if (
-          !payload || !isNonEmptyString(payload.email) ||
+          !payload || !email ||
           typeof payload.password !== "string" || payload.password.length < MIN_PASSWORD_LENGTH
         ) {
             safeUnlink(req.file?.path);
@@ -294,7 +301,7 @@ authRouter.post("/signup/verify_and_register",
         }
 
         // ตรวจสอบ OTP (ต้อง await และต้องเป็น OTP ของการสมัครสมาชิกเท่านั้น)
-        const otpResult = await verifyOTP({ email: payload.email, otp, hash, purpose: "signup" });
+        const otpResult = await verifyOTP({ email, otp, hash, purpose: "signup" });
         if (!otpResult.ok) {
             safeUnlink(req.file?.path);
             return sendOtpVerifyFail(res, otpResult);
@@ -313,7 +320,7 @@ authRouter.post("/signup/verify_and_register",
                 first_name: payload.first_name,
                 last_name: payload.last_name,
                 phone: payload.phone,
-                email: payload.email,
+                email,
                 password: hashedPassword,
 
                 job_position:   emptyToNull(payload.job_position),
@@ -356,8 +363,12 @@ authRouter.post("/signup/verify_and_register",
 
         res.status(201).json({ message: "สมัครสมาชิกสำเร็จ", user_id: result.id });
     } catch (error) {
-        console.error(error);
         safeUnlink(req.file?.path);
+        // อีเมลซ้ำ (เช่น สมัครพร้อมกัน 2 request หรือต่างกันแค่ตัวพิมพ์เล็ก/ใหญ่)
+        if (isUniqueViolation(error)) {
+            return res.status(409).json({ message: "อีเมลนี้อยู่ในระบบแล้ว" });
+        }
+        console.error(error);
         res.status(500).json({ message: "สมัครสมาชิกไม่สำเร็จ" });
     }
 });
@@ -373,8 +384,9 @@ authRouter.post("/login", async (req: Request, res: Response) => {
   try {
 
     // รับ Email และ Password
-    const { email, password } = req.body;
-    if (!isNonEmptyString(email) || typeof password !== "string") {
+    const email = parseEmail(req.body.email);
+    const { password } = req.body;
+    if (!email || typeof password !== "string") {
       return res.status(400).json({ error: "อีเมลหรือรหัสผ่านไม่ถูกต้อง" });
     }
 
@@ -382,7 +394,7 @@ authRouter.post("/login", async (req: Request, res: Response) => {
     const [existingUser] = await db
       .select()
       .from(users)
-      .where(eq(users.email, email));
+      .where(userEmailEquals(email));
 
     // เทียบรหัสผ่านเสมอ (ถ้าไม่พบ user ใช้ hash จำลอง) → เวลาตอบกลับเท่ากันทั้งสองกรณี
     const isMatch = await bcryptjs.compare(password, existingUser?.password ?? DUMMY_PASSWORD_HASH);
@@ -410,8 +422,9 @@ authRouter.post("/login", async (req: Request, res: Response) => {
 /// ── ขอ OTP Login ใหม่ (ต้องแนบ hash เดิมที่ได้จาก /login มาด้วย) ──────────────
 authRouter.post("/login/resend_otp", async (req: Request, res: Response) => {
   try {
-    const { email, hash } = req.body;
-    if (!isNonEmptyString(email) || !isNonEmptyString(hash)) {
+    const email = parseEmail(req.body.email);
+    const { hash } = req.body;
+    if (!email || !isNonEmptyString(hash)) {
       return res.status(400).json({ message: "ข้อมูลไม่ครบถ้วน" });
     }
 
@@ -432,9 +445,10 @@ authRouter.post("/login/resend_otp", async (req: Request, res: Response) => {
 /// ── ตรวจสอบ OTP (Login) ──────────────────────────────────────
 authRouter.post("/login/verify_otp", async (req: Request, res: Response) => {
     try {
-        const { email, otp, hash } = req.body;
+        const email = parseEmail(req.body.email);
+        const { otp, hash } = req.body;
 
-        if (!isNonEmptyString(email) || !isNonEmptyString(otp) || !isNonEmptyString(hash)) {
+        if (!email || !isNonEmptyString(otp) || !isNonEmptyString(hash)) {
             return res.status(400).json({ message: "ข้อมูลไม่ครบถ้วน" });
         }
 
@@ -444,7 +458,7 @@ authRouter.post("/login/verify_otp", async (req: Request, res: Response) => {
         }
 
         // ดึง user จาก email ที่ยืนยัน OTP ผ่านแล้วเท่านั้น
-        const [user] = await db.select().from(users).where(eq(users.email, email));
+        const [user] = await db.select().from(users).where(userEmailEquals(email));
         if (!user) {
           return res.status(404).json({ message: "ไม่พบผู้ใช้งาน" });
         }
@@ -467,13 +481,13 @@ authRouter.post("/login/verify_otp", async (req: Request, res: Response) => {
 /// ── Reset Password ด้วย Email >> ส่ง OTP ──────────────────────
 authRouter.post("/login/reset_password/send_otp", async (req: Request, res: Response) => {
   try {
-    const { email } = req.body;
-    if (!isNonEmptyString(email)) return res.status(400).json({ message: "กรุณาระบุอีเมล" });
+    const email = parseEmail(req.body.email);
+    if (!email) return res.status(400).json({ message: "รูปแบบอีเมลไม่ถูกต้อง" });
 
     const [existingUser] = await db
       .select({ email: users.email })
       .from(users)
-      .where(eq(users.email, email));
+      .where(userEmailEquals(email));
 
     // ไม่พบอีเมล >> สร้าง challenge จริงแต่ไม่ส่งเมล จึงใช้หน้านี้เดาไม่ได้ว่าอีเมลนี้มีในระบบหรือไม่
     const { hash, refCode } = await sendOTP({
@@ -492,9 +506,10 @@ authRouter.post("/login/reset_password/send_otp", async (req: Request, res: Resp
 authRouter.post("/login/reset_password/verify_and_reset", async (req: Request, res: Response) => {
   try {
 
-    const { email, otp, hash, new_password } = req.body;
+    const email = parseEmail(req.body.email);
+    const { otp, hash, new_password } = req.body;
 
-    if (!isNonEmptyString(email) || !isNonEmptyString(otp) || !isNonEmptyString(hash) || typeof new_password !== "string") {
+    if (!email || !isNonEmptyString(otp) || !isNonEmptyString(hash) || typeof new_password !== "string") {
       return res.status(400).json({ message: "ข้อมูลไม่ครบถ้วน" });
     }
 
@@ -515,7 +530,7 @@ authRouter.post("/login/reset_password/verify_and_reset", async (req: Request, r
       const [updatedUser] = await tx
         .update(users)
         .set({ password: hashedPassword })
-        .where(eq(users.email, email))
+        .where(userEmailEquals(email))
         .returning();
  
       if (!updatedUser) throw new Error("ไม่พบผู้ใช้งาน");
