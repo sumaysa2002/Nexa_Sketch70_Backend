@@ -123,7 +123,7 @@ export const sendOTP = async ({
     )
     .orderBy(asc(otpChallenges.created_at));
 
-  // 1.3 เพดานรายวัน: ขอได้อีกครั้งเมื่อครั้งที่เก่าที่สุดในกลุ่ม 20 ครั้งล่าสุดครบ 24 ชม.
+  // 1.3 เพดานรายวัน: ขอได้อีกครั้งเมื่อครั้งที่เก่าที่สุดในกลุ่ม 15 ครั้งล่าสุดครบ 24 ชม.
   if (sends.length >= MAX_SENDS_PER_DAY) {
     const oldest = sends[sends.length - MAX_SENDS_PER_DAY]!.created_at;
     throw quotaError(new Date(oldest.getTime() + DAY_MS), now);

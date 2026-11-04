@@ -15,7 +15,7 @@ services:
 
   db:
     image: postgres:15
-    container_name: postgres_gnss_container
+    container_name: nexa_sketch_db
     restart: always
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
@@ -28,3 +28,4 @@ services:
 
 volumes:
   postgres_data:
+    name: backend_offline_postgres_data
