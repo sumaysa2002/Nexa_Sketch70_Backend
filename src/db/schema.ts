@@ -138,8 +138,8 @@ export const projectMembers = pgTable("project_members", {
 
   id:               serial("id").primaryKey(),
 
-  project_id:       integer("project_id").notNull(),         // FK → projects.id
-  user_id:          integer("user_id").notNull(),            // FK → users.id
+  project_id:       integer("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),         // FK → projects.id
+  user_id:          integer("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),            // FK → users.id
 
   time_add_members: timestamp("time_add_members", { withTimezone: true,}).notNull(),
   
@@ -188,7 +188,7 @@ export const points = pgTable("points", {
 
   id:                  serial("id").primaryKey(),
 
-  project_id:          integer("project_id").notNull(),                           // FK → projects.id
+  project_id:          integer("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),                           // FK → projects.id
   point_name:          text("point_name").notNull(),
 
   northing:             numeric("northing", { precision: 10, scale: 3 }),
