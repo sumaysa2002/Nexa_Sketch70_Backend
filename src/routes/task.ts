@@ -1,35 +1,18 @@
 import { Router } from "express";
 import { auth, requireAdmin, type AuthRequest } from "../middleware/auth.js";
-import { projects, projectMembers, projectHistory, users, points, pointHistory } from "../db/schema.js";
+import { projects, projectMembers, projectHistory, users, usersHistory, points, pointHistory } from "../db/schema.js";
 import type { NewProject, Project } from "../db/schema.js";
 import { db } from "../db/index.js";
 import { sql } from "drizzle-orm";
 import type { Request, Response } from "express";
 import { eq, asc, desc, and, inArray} from "drizzle-orm";
 import { emptyToNull, toNumericOrNull, toIntOrNull, parseId } from "../helper/null.js";
+import { getProjectCreatorId, getProjectAccess, activeGroupUserIds, everApprovedByAdmin } from "../helper/project_access.js";
 import path from "path";
 import fs from "fs";
 
 
 const taskRouter = Router();
-
-/// ─── หา admin ที่เป็นผู้สร้างโครงการ ──────────
-async function getProjectCreatorId(projectId: number): Promise<number | null> {
-  const [row] = await db
-    .select({ project_user_creator: projectHistory.project_user_creator })
-    .from(projectHistory)
-    .where(
-      and(
-        eq(projectHistory.project_id, projectId),
-        sql`${projectHistory.project_user_creator} IS NOT NULL`
-      )
-    )
-    .orderBy(asc(projectHistory.project_time_created))
-    .limit(1);
-
-  return row?.project_user_creator ?? null;
-}
-
 
 /* ============================================================
    ตรวจสอบข้อมูลโครงการ
@@ -120,6 +103,51 @@ async function filterMemberIds(adminId: number, raw: unknown, strict: boolean): 
     throw new BadInput("มีสมาชิกที่คุณไม่ได้อนุมัติสมาชิก");
   }
   return valid;
+}
+
+
+/// ─── รายชื่อสมาชิกใหม่ตอนแก้ไขโครงการ (ทั้ง admin เจ้าของและ Editor) ──────────
+// project_members เก็บทั้ง "สมาชิกปัจจุบัน" และ "อดีตสมาชิก" (ถูกถอนอนุมัติแล้ว) ไว้เป็นประวัติผู้จัดทำ
+// - เพิ่มได้เฉพาะ user ที่ยังอนุมัติอยู่ในกลุ่มของ admin เจ้าของ (หรือตัว admin เอง)
+// - อดีตสมาชิกที่อยู่ในโครงการอยู่แล้ว: คงไว้ได้ (ไม่มีสิทธิ์แก้ไข เพราะ getProjectAccess ตรวจสถานะ)
+//     · Editor ลบอดีตสมาชิกออกไม่ได้ (ไม่ส่งมาก็ยังคงอยู่) >> กันประวัติหาย
+//     · admin เจ้าของโครงการลบออกได้ ถ้าตั้งใจไม่ส่งมา
+// - อดีตสมาชิกกลุ่มที่ไม่เคยอยู่ในโครงการนี้ (เช่น ค่าค้างจาก cache) >> ตัดทิ้งเงียบๆ
+// - คนนอกกลุ่ม / ยังไม่อนุมัติ / admin คนอื่น >> 400
+async function resolveMemberUpdate(
+  projectId: number,
+  creatorId: number,
+  raw: unknown,
+  isOwnerAdmin: boolean
+): Promise<number[]> {
+  if (raw !== null && (!Array.isArray(raw) || raw.length > 500)) throw new BadInput("สมาชิกไม่ถูกต้อง");
+
+  const ids = raw === null ? [] : [...new Set((raw as unknown[]).map(Number))];
+  if (ids.some((n) => !Number.isInteger(n) || n <= 0)) throw new BadInput("สมาชิกไม่ถูกต้อง");
+
+  // อดีตสมาชิกที่อยู่ในโครงการนี้ตอนนี้ (ไม่ active แต่เคยได้รับอนุมัติจาก admin เจ้าของ)
+  const currentIds = (await db
+    .select({ user_id: projectMembers.user_id })
+    .from(projectMembers)
+    .where(eq(projectMembers.project_id, projectId))
+  ).map((r) => r.user_id);
+
+  const allIds     = [...new Set([...ids, ...currentIds])];
+  const active     = await activeGroupUserIds(creatorId, allIds);
+  const everInGrp  = await everApprovedByAdmin(creatorId, allIds.filter((id) => !active.has(id)));
+  const historical = new Set(currentIds.filter((id) => !active.has(id) && everInGrp.has(id)));
+
+  const keep = new Set<number>();
+  for (const id of ids) {
+    if (active.has(id) || historical.has(id)) keep.add(id);
+    else if (!everInGrp.has(id)) throw new BadInput("มีสมาชิกที่ไม่ได้รับการอนุมัติจากผู้ดูแลโครงการนี้");
+    // อดีตสมาชิกกลุ่มที่ไม่เคยอยู่โครงการนี้ >> ข้าม
+  }
+
+  // Editor ไม่มีสิทธิ์ลบประวัติอดีตสมาชิก
+  if (!isOwnerAdmin) historical.forEach((id) => keep.add(id));
+
+  return [...keep];
 }
 
 
@@ -321,13 +349,39 @@ taskRouter.get("/projects", auth, async (req: AuthRequest, res: Response) => {
         .orderBy(desc(projectHistory.project_time_created));
     }
 
-    // ดึงข้อมูลสมาชิกทั้งหมดในโครงการ
-    const allMembers = await db
+    // ดึงสมาชิกเฉพาะโครงการที่ส่งกลับ และเฉพาะคนที่ยังอยู่ในกลุ่ม (ตัดคนที่ถูกถอนอนุมัติ)
+    const projectIds = allProjects.map((p) => p.id);
+    const creatorOf  = new Map(allProjects.map((p) => [p.id, p.project_user_creator]));
+
+    const memberRows = projectIds.length === 0 ? [] : await db
       .select({
         project_id: projectMembers.project_id,
         user_id:    projectMembers.user_id,
+        status:     users.status,
+        admin:      users.admin,
       })
-      .from(projectMembers);
+      .from(projectMembers)
+      .innerJoin(users, eq(users.id, projectMembers.user_id))
+      .where(inArray(projectMembers.project_id, projectIds));
+
+    // ประวัติการอนุมัติ: (user_id, admin) คู่ไหนเคยอนุมัติกันมาแล้ว >> อดีตสมาชิกยังแสดงในรายชื่อ
+    const memberUserIds = [...new Set(memberRows.map((m) => m.user_id))];
+    const approvals = memberUserIds.length === 0 ? [] : await db
+      .select({ user_id: usersHistory.user_id, admin_id: usersHistory.admin_approved_user })
+      .from(usersHistory)
+      .where(and(
+        inArray(usersHistory.user_id, memberUserIds),
+        sql`${usersHistory.admin_approved_user} IS NOT NULL`
+      ));
+    const approvedPair = new Set(approvals.map((a) => `${a.user_id}:${a.admin_id}`));
+
+    // สมาชิกที่แสดง = admin เจ้าของ + สมาชิกปัจจุบัน + อดีตสมาชิกของกลุ่มนี้ (ตัดคนนอกกลุ่มที่ค้างจากข้อมูลเก่า)
+    const allMembers = memberRows.filter((m) => {
+      const creator = creatorOf.get(m.project_id);
+      return m.user_id === creator
+        || (m.status === "user" && m.admin === String(creator))
+        || approvedPair.has(`${m.user_id}:${creator}`);
+    });
 
     const result = allProjects.map((project) => {
 
@@ -362,35 +416,13 @@ taskRouter.put("/update_project/:id", auth, async (req: AuthRequest, res: Respon
       return res.status(400).json({ error: "projectId ไม่ถูกต้อง" });
     }
 
-    // ตรวจสอบสิทธิ์แก้ไข
-    const creatorId = await getProjectCreatorId(projectId);
-    if (creatorId === null) {
+    // ตรวจสอบสิทธิ์แก้ไข (admin เจ้าของ หรือ Editor ที่ยังอยู่ในกลุ่ม)
+    const access = await getProjectAccess(userId, projectId);
+    if (!access) {
       return res.status(404).json({ error: "ไม่พบโครงการที่ต้องการแก้ไข" });
     }
-
-    const [currentUser] = await db
-      .select({ id: users.id, status: users.status })
-      .from(users)
-      .where(eq(users.id, userId));
-
-    const isOwnerAdmin = currentUser?.status === "admin" && creatorId === userId;
-
-    let isEditorMember = false;
-    if (!isOwnerAdmin) {
-      const [member] = await db
-        .select({ id: projectMembers.id })
-        .from(projectMembers)
-        .where(
-          and(
-            eq(projectMembers.project_id, projectId),
-            eq(projectMembers.user_id, userId)
-          )
-        );
-      isEditorMember = !!member;
-    }
-
-    if (!isOwnerAdmin && !isEditorMember) {
-      return res.status(403).json({ error: "ไม่มีสิทธิ์แก้ไขโครงการนี้" });
+    if (!access.canEdit) {
+      return res.status(403).json({ error: "คุณไม่มีสิทธิ์แก้ไขโครงการนี้" });
     }
 
     const {
@@ -408,6 +440,11 @@ taskRouter.put("/update_project/:id", auth, async (req: AuthRequest, res: Respon
       project_note,
       member_ids,
     } = req.body;
+
+    // ไม่ส่ง member_ids มา = ไม่แก้รายชื่อสมาชิก
+    const newMemberIds = member_ids === undefined
+      ? null
+      : await resolveMemberUpdate(projectId, access.creatorId, member_ids, access.isOwnerAdmin);
 
     const result = await db.transaction(async (tx) => {
 
@@ -433,14 +470,16 @@ taskRouter.put("/update_project/:id", auth, async (req: AuthRequest, res: Respon
 
       if (!updatedProject) throw new Error("ไม่พบโครงการที่ต้องการแก้ไข");
 
-      // ลบ members เดิมออก แล้ว insert ใหม่
-      await tx
-        .delete(projectMembers)
-        .where(eq(projectMembers.project_id, projectId));
+      // ลบ members เดิมออก แล้ว insert ใหม่ (เฉพาะเมื่อส่ง member_ids มา)
+      if (newMemberIds !== null) {
+        await tx
+          .delete(projectMembers)
+          .where(eq(projectMembers.project_id, projectId));
+      }
 
-      if (Array.isArray(member_ids) && member_ids.length > 0) {
+      if (newMemberIds !== null && newMemberIds.length > 0) {
         await tx.insert(projectMembers).values(
-          member_ids.map((uid: number) => ({
+          newMemberIds.map((uid) => ({
             project_id:   projectId,
             user_id:      uid,
             time_add_members: sql`now()`,
@@ -460,6 +499,7 @@ taskRouter.put("/update_project/:id", auth, async (req: AuthRequest, res: Respon
 
     res.status(200).json(result);
   } catch (e) {
+    if (e instanceof BadInput) return res.status(400).json({ error: e.message });
     console.error("[PUT /update_project] error:", e);
     res.status(500).json({ error: "แก้ไขโครงการไม่สำเร็จ" });
   }

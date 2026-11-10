@@ -11,92 +11,25 @@ import path from "path";
 import fs from "fs";
 import { fileTypeFromFile } from "file-type";
 import { normalizeUploadedFiles, ImageProcessError, POINT_IMAGE_OPTIONS } from "../helper/image.js";
+import { getProjectAccess, canEditProject, canViewProject, activeGroupUserIds } from "../helper/project_access.js";
 
 
 const point_task_Router = Router();
 
 
-/// ─── ตรวจสอบว่า user นี้มีสิทธิ์แก้ไขโครงการนี้หรือไม่ ────────────────────────────────────
-async function canEditProject(userId: number, projectId: number): Promise<boolean> {
-  const [creatorRow] = await db
-    .select({ project_user_creator: projectHistory.project_user_creator })
-    .from(projectHistory)
-    .where(
-      and(
-        eq(projectHistory.project_id, projectId),
-        sql`${projectHistory.project_user_creator} IS NOT NULL`
-      )
-    )
-    .orderBy(asc(projectHistory.project_time_created))
-    .limit(1);
+/// ─── ตรวจสอบผู้รังวัด / ผู้ตรวจสอบ ────────────────────────────────────
+type SurveyPeople = { technician: number | null; qc: number | null };
 
-  const creatorId = creatorRow?.project_user_creator ?? null;
-  if (creatorId === null) return false; // ไม่พบโครงการ
+async function assertSurveyPeople(creatorId: number, next: SurveyPeople, before?: SurveyPeople) {
+  const check: number[] = [];
+  if (next.technician !== null && next.technician !== before?.technician) check.push(next.technician);
+  if (next.qc !== null && next.qc !== before?.qc) check.push(next.qc);
+  if (check.length === 0) return;
 
-  const [currentUser] = await db
-    .select({ id: users.id, status: users.status })
-    .from(users)
-    .where(eq(users.id, userId));
-
-  if (currentUser?.status === "admin" && creatorId === userId) return true;
-
-  const [member] = await db
-    .select({ id: projectMembers.id })
-    .from(projectMembers)
-    .where(
-      and(
-        eq(projectMembers.project_id, projectId),
-        eq(projectMembers.user_id, userId)
-      )
-    );
-
-  return !!member;
-}
-
-
-/// ─── ตรวจสอบว่า user นี้มีสิทธิ์เข้าถึงโครงการนี้หรือไม่ ────────────────────────────────────
-async function canViewProject(userId: number, projectId: number): Promise<boolean> {
-  const [creatorRow] = await db
-    .select({ project_user_creator: projectHistory.project_user_creator })
-    .from(projectHistory)
-    .where(
-      and(
-        eq(projectHistory.project_id, projectId),
-        sql`${projectHistory.project_user_creator} IS NOT NULL`
-      )
-    )
-    .orderBy(asc(projectHistory.project_time_created))
-    .limit(1);
-
-  const creatorId = creatorRow?.project_user_creator ?? null;
-  if (creatorId === null) return false; // ไม่พบโครงการ
-
-  const [currentUser] = await db
-    .select({ status: users.status, admin: users.admin })
-    .from(users)
-    .where(eq(users.id, userId));
-
-  if (!currentUser) return false;
-
-  if (currentUser.status === "admin") return creatorId === userId;
-  if (currentUser.status !== "user")  return false;
-
-  // user ในกลุ่มของ admin ผู้สร้างโครงการ
-  const adminId = currentUser.admin ? parseInt(currentUser.admin) : NaN;
-  if (adminId === creatorId) return true;
-
-  // เป็นสมาชิกโครงการโดยตรง
-  const [member] = await db
-    .select({ id: projectMembers.id })
-    .from(projectMembers)
-    .where(
-      and(
-        eq(projectMembers.project_id, projectId),
-        eq(projectMembers.user_id, userId)
-      )
-    );
-
-  return !!member;
+  const active = await activeGroupUserIds(creatorId, check);
+  if (check.some((id) => !active.has(id))) {
+    throw new BadInput("ผู้รังวัดหรือผู้ตรวจสอบต้องเป็นสมาชิกในโครงการ");
+  }
 }
 
 
@@ -396,10 +329,10 @@ point_task_Router.post("/create_point",
       }
 
       // ตรวจสอบสิทธิ์ก่อนสร้าง point
-      const hasAccess = await canEditProject(userId, projectId);
-      if (!hasAccess) {
+      const access = await getProjectAccess(userId, projectId);
+      if (!access?.canEdit) {
         cleanupTemp();
-        return res.status(403).json({ error: "ไม่มีสิทธิ์เพิ่มข้อมูลในโครงการนี้" });
+        return res.status(403).json({ error: "คุณไม่มีสิทธิ์เพิ่มข้อมูลในโครงการนี้" });
       }
 
       // ── ตรวจและแปลงข้อมูลก่อนเปิด transaction >> ข้อมูลผิดตอบ 400 (client จะไม่ retry ซ้ำ) ──
@@ -453,6 +386,12 @@ point_task_Router.post("/create_point",
 
           client_uuid:   clientUuid,
         };
+
+        // หมุดใหม่: ผู้รังวัด/ผู้ตรวจสอบต้องยังอยู่ในกลุ่ม
+        await assertSurveyPeople(access.creatorId, {
+          technician: values.survey_technician,
+          qc:         values.survey_qc,
+        });
       } catch (e) {
         cleanupTemp();
         return res.status(400).json({ error: (e as Error).message });
@@ -579,7 +518,7 @@ point_task_Router.get("/points/:project_id",
       // ตรวจสอบสิทธิ์เข้าถึงข้อมูลโครงการนี้
       const hasAccess = await canViewProject(req.user!, projectId);
       if (!hasAccess) {
-        res.status(403).json({ error: "ไม่มีสิทธิ์เข้าถึงข้อมูลในโครงการนี้" });
+        res.status(403).json({ error: "คุณไม่มีสิทธิ์เข้าถึงข้อมูลในโครงการนี้" });
         return;
       }
 
@@ -642,10 +581,25 @@ point_task_Router.put("/update_point/:point_id",
       const projectId = existing.project_id;
 
       // ตรวจสอบสิทธิ์แก้ไข point ในโครงการนี้
-      const hasAccess = await canEditProject(userId, projectId);
-      if (!hasAccess) {
+      const access = await getProjectAccess(userId, projectId);
+      if (!access?.canEdit) {
         for (const p of tempPaths) if (fs.existsSync(p)) fs.unlinkSync(p);
-        return res.status(403).json({ error: "ไม่มีสิทธิ์แก้ไขข้อมูลในโครงการนี้" });
+        return res.status(403).json({ error: "คุณไม่มีสิทธิ์แก้ไขข้อมูลในโครงการนี้" });
+      }
+
+      // ผู้รังวัด/ผู้ตรวจสอบ: ค่าที่เปลี่ยนใหม่ต้องอยู่ในกลุ่ม ค่าเดิมคงไว้ได้ (แม้ถูกถอนอนุมัติแล้ว)
+      try {
+        await assertSurveyPeople(
+          access.creatorId,
+          {
+            technician: toIntOrNull(req.body.survey_technician, "ผู้รังวัด"),
+            qc:         toIntOrNull(req.body.survey_qc, "ผู้ตรวจสอบ"),
+          },
+          { technician: existing.survey_technician, qc: existing.survey_qc }
+        );
+      } catch (e) {
+        for (const p of tempPaths) if (fs.existsSync(p)) fs.unlinkSync(p);
+        return res.status(400).json({ error: (e as Error).message });
       }
 
       const {
@@ -870,7 +824,7 @@ point_task_Router.delete("/delete_point/:point_id",
       // ตรวจสอบสิทธิ์ลบ point ในโครงการนี้
       const hasAccess = await canEditProject(userId, projectId);
       if (!hasAccess) {
-        return res.status(403).json({ error: "ไม่มีสิทธิ์ลบข้อมูลในโครงการนี้" });
+        return res.status(403).json({ error: "คุณไม่มีสิทธิ์ลบข้อมูลในโครงการนี้" });
       }
 
       await db.transaction(async (tx) => {
@@ -930,7 +884,7 @@ point_task_Router.get("/image/:project_id/:point_id/:filename",
       // ตรวจสิทธิ์
       const hasAccess = await canViewProject(req.user!, projectId);
       if (!hasAccess) {
-        res.status(403).json({ error: "ไม่มีสิทธิ์เข้าถึงข้อมูลโครงการ" });
+        res.status(403).json({ error: "คุณไม่มีสิทธิ์เข้าถึงข้อมูลโครงการ" });
         return;
       }
 
