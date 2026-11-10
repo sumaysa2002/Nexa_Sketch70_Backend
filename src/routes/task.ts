@@ -70,7 +70,7 @@ function cleanProjectInput(p: any) {
   };
 }
 
-/// สมาชิกที่เพิ่มได้ต้องเป็น user ที่อยู่ในกลุ่มของ admin เท่านั้น
+/// เลือกสมาชิกโครงการ >> user ที่ได้รับอนุมัติจาก admin
 async function filterMemberIds(adminId: number, raw: unknown, strict: boolean): Promise<number[]> {
   if (raw === undefined || raw === null) return [];
   if (!Array.isArray(raw) || raw.length > 500) throw new BadInput("สมาชิกไม่ถูกต้อง");
@@ -86,7 +86,7 @@ async function filterMemberIds(adminId: number, raw: unknown, strict: boolean): 
   const includeSelf = clean.includes(adminId);
   const others = clean.filter((n) => n !== adminId);
 
-  // สมาชิกคนอื่นต้องเป็น user ที่อยู่ในกลุ่มของ admin
+  // สมาชิกต้องได้รับอนุมัติจาก admin
   const rows = others.length === 0 ? [] : await db
     .select({ id: users.id })
     .from(users)
@@ -106,14 +106,8 @@ async function filterMemberIds(adminId: number, raw: unknown, strict: boolean): 
 }
 
 
-/// ─── รายชื่อสมาชิกใหม่ตอนแก้ไขโครงการ (ทั้ง admin เจ้าของและ Editor) ──────────
-// project_members เก็บทั้ง "สมาชิกปัจจุบัน" และ "อดีตสมาชิก" (ถูกถอนอนุมัติแล้ว) ไว้เป็นประวัติผู้จัดทำ
-// - เพิ่มได้เฉพาะ user ที่ยังอนุมัติอยู่ในกลุ่มของ admin เจ้าของ (หรือตัว admin เอง)
-// - อดีตสมาชิกที่อยู่ในโครงการอยู่แล้ว: คงไว้ได้ (ไม่มีสิทธิ์แก้ไข เพราะ getProjectAccess ตรวจสถานะ)
-//     · Editor ลบอดีตสมาชิกออกไม่ได้ (ไม่ส่งมาก็ยังคงอยู่) >> กันประวัติหาย
-//     · admin เจ้าของโครงการลบออกได้ ถ้าตั้งใจไม่ส่งมา
-// - อดีตสมาชิกกลุ่มที่ไม่เคยอยู่ในโครงการนี้ (เช่น ค่าค้างจาก cache) >> ตัดทิ้งเงียบๆ
-// - คนนอกกลุ่ม / ยังไม่อนุมัติ / admin คนอื่น >> 400
+/// ─── รายชื่อสมาชิกตอนแก้ไขโครงการ (ทั้ง admin และ Editor) ──────────
+// project_members เก็บทั้ง "สมาชิกโครงการที่ได้รับการอนุมัติจาก admin" และ "สมาชิกโครงการที่ถูกถอนการอนุมัติจาก admin ไปแล้ว"
 async function resolveMemberUpdate(
   projectId: number,
   creatorId: number,
@@ -125,7 +119,7 @@ async function resolveMemberUpdate(
   const ids = raw === null ? [] : [...new Set((raw as unknown[]).map(Number))];
   if (ids.some((n) => !Number.isInteger(n) || n <= 0)) throw new BadInput("สมาชิกไม่ถูกต้อง");
 
-  // อดีตสมาชิกที่อยู่ในโครงการนี้ตอนนี้ (ไม่ active แต่เคยได้รับอนุมัติจาก admin เจ้าของ)
+  // สมาชิกโครงการที่ถูกถอนการอนุมัติจาก admin ไปแล้ว (แต่เป็นสมาชิกในโครงการ)
   const currentIds = (await db
     .select({ user_id: projectMembers.user_id })
     .from(projectMembers)
@@ -141,7 +135,6 @@ async function resolveMemberUpdate(
   for (const id of ids) {
     if (active.has(id) || historical.has(id)) keep.add(id);
     else if (!everInGrp.has(id)) throw new BadInput("มีสมาชิกที่ไม่ได้รับการอนุมัติจากผู้ดูแลโครงการนี้");
-    // อดีตสมาชิกกลุ่มที่ไม่เคยอยู่โครงการนี้ >> ข้าม
   }
 
   // Editor ไม่มีสิทธิ์ลบประวัติอดีตสมาชิก

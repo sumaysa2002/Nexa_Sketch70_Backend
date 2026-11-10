@@ -4,12 +4,10 @@ import { projectHistory, projectMembers, users, usersHistory } from "../db/schem
 
 /* ============================================================
    สิทธิ์เข้าถึงโครงการ (ใช้ร่วมกันทั้ง task.ts และ point_task.ts)
-
    - admin เจ้าของโครงการ        >> ดูได้ + แก้ไขได้
    - user ในกลุ่มของ admin นั้น   >> ดูได้
        + เป็นสมาชิกโครงการ       >> แก้ไขได้
-   - user ที่ถูกถอนอนุมัติ / อยู่กลุ่มอื่น / admin คนอื่น >> ไม่มีสิทธิ์
-     (แม้จะยังมีแถวค้างใน project_members ก็ตาม)
+   - user ที่ถูกถอนอนุมัติ / อยู่กลุ่มอื่น / admin คนอื่น >> ไม่มีสิทธิ์ (แม้จะยังมีแถวค้างใน project_members ก็ตาม)
 ============================================================ */
 
 /// ─── หา admin ที่เป็นผู้สร้างโครงการ ──────────
@@ -50,13 +48,13 @@ export async function getProjectAccess(userId: number, projectId: number): Promi
 
   if (!me) return none;
 
-  // admin: เฉพาะเจ้าของโครงการ
+  // admin: เจ้าของโครงการ
   if (me.status === "admin") {
     const owner = me.id === creatorId;
     return { creatorId, isOwnerAdmin: owner, canView: owner, canEdit: owner };
   }
 
-  // user: ต้องยังได้รับอนุมัติ และอยู่ในกลุ่มของ admin ผู้สร้างโครงการ
+  // user: ได้รับอนุมัติจาก admin และเป็นสมาชิกโครงการ
   if (me.status !== "user" || me.admin !== String(creatorId)) return none;
 
   const [member] = await db
@@ -76,7 +74,7 @@ export async function canEditProject(userId: number, projectId: number): Promise
   return (await getProjectAccess(userId, projectId))?.canEdit ?? false;
 }
 
-/// ─── id ที่ "ยังใช้งานอยู่" ในกลุ่มของ admin (ตัว admin เอง + user ที่อนุมัติแล้ว) ──────────
+/// ─── id ที่อยู่ในกลุ่มของ admin (ตัว admin เอง + user ที่อนุมัติแล้ว) ──────────
 export async function activeGroupUserIds(adminId: number, ids: number[]): Promise<Set<number>> {
   const out = new Set<number>();
   const others = ids.filter((id) => id !== adminId);
@@ -92,8 +90,7 @@ export async function activeGroupUserIds(adminId: number, ids: number[]): Promis
   return out;
 }
 
-/// ─── id ที่ "เคยได้รับอนุมัติ" จาก admin นี้ (รวมคนที่ถูกถอนอนุมัติไปแล้ว) ──────────
-// ใช้แยก "อดีตสมาชิกกลุ่ม" (เก็บไว้เป็นประวัติผู้จัดทำได้) ออกจากคนนอกกลุ่ม
+/// ─── id ที่ "เคยได้รับอนุมัติ" จาก admin (รวมคนที่ถูกถอนอนุมัติไปแล้ว) ──────────
 export async function everApprovedByAdmin(adminId: number, ids: number[]): Promise<Set<number>> {
   if (ids.length === 0) return new Set();
   const rows = await db
