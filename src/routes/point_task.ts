@@ -1,9 +1,8 @@
 import { Router } from "express";
 import { auth, type AuthRequest } from "../middleware/auth.js";
-import { points, pointHistory, pointDataJson, users, projectMembers, projectHistory } from "../db/schema.js";
+import { points, pointHistory, pointDataJson, users, projectMembers, projectHistory, projects } from "../db/schema.js";
 import { db } from "../db/index.js";
-//import { sql } from "drizzle-orm";
-import { sql, eq, asc, and, getTableColumns } from "drizzle-orm";
+import { sql, eq, asc, desc, and, isNull, isNotNull, getTableColumns } from "drizzle-orm";
 import { emptyToNull, toNumericOrNull, toIntOrNull, parseId } from "../helper/null.js";
 import type { Response } from "express";
 import multer from "multer";
@@ -12,6 +11,8 @@ import fs from "fs";
 import { fileTypeFromFile } from "file-type";
 import { normalizeUploadedFiles, ImageProcessError, POINT_IMAGE_OPTIONS } from "../helper/image.js";
 import { getProjectAccess, canEditProject, canViewProject, activeGroupUserIds } from "../helper/project_access.js";
+import { daysLeftSql, purgeAtSql, notExpiredSql } from "../helper/trash.js";
+import { purgePointsNow } from "../helper/trash_purge.js";
 
 
 const point_task_Router = Router();
@@ -515,8 +516,11 @@ point_task_Router.get("/points/:project_id",
         return;
       }
 
+      // ?include_deleted=1 >> ดูหมุดของโครงการที่อยู่ในประวัติการลบ
+      const includeDeleted = req.query["include_deleted"] === "1";
+
       // ตรวจสอบสิทธิ์เข้าถึงข้อมูลโครงการนี้
-      const hasAccess = await canViewProject(req.user!, projectId);
+      const hasAccess = await canViewProject(req.user!, projectId, { includeDeleted });
       if (!hasAccess) {
         res.status(403).json({ error: "คุณไม่มีสิทธิ์เข้าถึงข้อมูลในโครงการนี้" });
         return;
@@ -530,7 +534,7 @@ point_task_Router.get("/points/:project_id",
       })
       .from(points)
       .leftJoin(pointDataJson, eq(pointDataJson.point_id, points.id))
-      .where(eq(points.project_id, projectId))
+      .where(and(eq(points.project_id, projectId), isNull(points.deleted_at)))
       .orderBy(asc(points.point_name));
 
       res.status(200).json(allPoints);
@@ -571,7 +575,7 @@ point_task_Router.put("/update_point/:point_id",
       const [existing] = await db
         .select()
         .from(points)
-        .where(eq(points.id, pointId));
+        .where(and(eq(points.id, pointId), isNull(points.deleted_at)));
 
       if (!existing) {
         res.status(404).json({ error: "ไม่พบหมุดรังวัด" });
@@ -795,7 +799,7 @@ point_task_Router.put("/update_point/:point_id",
 );
 
 
-/// ── ลบ Point ──────────────────────────────────────────────────
+/// ── ลบ Point >> เก็บไว้ 30 วันแล้วค่อยลบถาวร ──────────────────
 point_task_Router.delete("/delete_point/:point_id",
   auth,
   async (req: AuthRequest, res: Response) => {
@@ -808,11 +812,11 @@ point_task_Router.delete("/delete_point/:point_id",
         return;
       }
 
-      // ── ดึงข้อมูล point ก่อน (เพื่อเอา project_id ไปลบโฟเดอร์) ──
+      // ── ดึงข้อมูล point
       const [existingPoint] = await db
         .select({ id: points.id, project_id: points.project_id })
         .from(points)
-        .where(eq(points.id, pointId));
+        .where(and(eq(points.id, pointId), isNull(points.deleted_at)));
 
       if (!existingPoint) {
         res.status(404).json({ error: "ไม่พบหมุดรังวัดที่ต้องการลบ" });
@@ -827,28 +831,28 @@ point_task_Router.delete("/delete_point/:point_id",
         return res.status(403).json({ error: "คุณไม่มีสิทธิ์ลบข้อมูลในโครงการนี้" });
       }
 
-      await db.transaction(async (tx) => {
+      // ไม่ลบ points / point_data_json / project_members / โฟลเดอร์รูป >> เก็บไว้ให้กู้คืนได้
+      const deleted = await db.transaction(async (tx) => {
+        const [row] = await tx
+          .update(points)
+          .set({ deleted_at: sql`now()`, deleted_by: userId })
+          .where(and(eq(points.id, pointId), isNull(points.deleted_at)))
+          .returning({ id: points.id });
 
-        // ── 1. Insert point_history บันทึกการลบ ────────────────
+        if (!row) return false;
+
         await tx.insert(pointHistory).values({
           project_id:        projectId,
           point_id:          pointId,
           point_user_delete: userId,
           point_time_delete: sql`now()`,
         });
-
-        // ── 2. ลบ point ออกจาก DB ──────────────────────────────
-        await tx
-          .delete(points)
-          .where(eq(points.id, pointId));
-
+        return true;
       });
 
-      // ── 3. ลบโฟเดอร์รูปภาพทั้งหมดของ point ──────────────────
-      const pointDir = path.join("uploads", "point", String(projectId), String(pointId));
-      if (fs.existsSync(pointDir)) {
-        fs.rmSync(pointDir, { recursive: true, force: true });
-        console.log(`[DELETE] removed dir: ${pointDir}`);
+      if (!deleted) {
+        res.status(404).json({ error: "ไม่พบหมุดรังวัดที่ต้องการลบ" });
+        return;
       }
 
       res.status(200).json({ message: "ลบหมุดรังวัดสำเร็จ" });
@@ -856,6 +860,206 @@ point_task_Router.delete("/delete_point/:point_id",
     } catch (e) {
       console.error("[DELETE /delete_point] error:", e);
       res.status(500).json({ error: "ลบหมุดรังวัดไม่สำเร็จ" });
+    }
+  }
+);
+
+
+/// ── รายการหมุดที่ถูกลบของโครงการ (ลบหมุด ไม่ลบโครงการ) เรียงจากลบล่าสุด >> เก่าสุด ──────────────────
+point_task_Router.get("/deleted_point/:project_id",
+  auth,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const projectId = parseId(req.params["project_id"]);
+      if (projectId === null) {
+        res.status(400).json({ error: "Project ID ไม่ถูกต้อง" });
+        return;
+      }
+
+      const hasAccess = await canEditProject(req.user!, projectId);
+      if (!hasAccess) {
+        res.status(403).json({ error: "คุณไม่มีสิทธิ์เข้าถึงประวัติการลบในโครงการนี้" });
+        return;
+      }
+
+      const rows = await db
+        .select({
+          ...getTableColumns(points),
+          draw_data_json:    pointDataJson.draw_data_json,
+          details_data_json: pointDataJson.details_data_json,
+          deleted_by_name:   sql<string | null>`(SELECT concat_ws(' ', u.title_name, u.first_name, u.last_name) FROM users u WHERE u.id = ${points.deleted_by})`,
+          purge_at:          purgeAtSql(points.deleted_at),
+          days_left:         daysLeftSql(points.deleted_at),
+        })
+        .from(points)
+        .leftJoin(pointDataJson, eq(pointDataJson.point_id, points.id))
+        .where(
+          and(
+            eq(points.project_id, projectId),
+            isNotNull(points.deleted_at),
+            notExpiredSql(points.deleted_at),
+          )
+        )
+        .orderBy(desc(points.deleted_at));
+
+      res.status(200).json(rows);
+    } catch (e) {
+      console.error("[GET /deleted/:project_id] error:", e);
+      res.status(500).json({ error: "ดึงประวัติการลบหมุดรังวัดไม่สำเร็จ" });
+    }
+  }
+);
+
+
+/// ── กู้คืนหมุดรังวัด (ภายใน 30 วันหลังลบ) ──────────────────
+point_task_Router.post("/restore_point/:point_id",
+  auth,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const userId  = req.user!;
+      const pointId = parseId(req.params["point_id"]);
+      if (pointId === null) {
+        res.status(400).json({ error: "point ID ไม่ถูกต้อง" });
+        return;
+      }
+
+      const [existing] = await db
+        .select({ id: points.id, project_id: points.project_id })
+        .from(points)
+        .where(and(eq(points.id, pointId), isNotNull(points.deleted_at), notExpiredSql(points.deleted_at)));
+
+      if (!existing) {
+        res.status(404).json({ error: "ไม่พบหมุดรังวัดในประวัติการลบ หรือหมุดรังวัดอาจครบกำหนด 30 วันแล้ว" });
+        return;
+      }
+
+      const projectId = existing.project_id;
+
+      // ตรวจสอบสิทธิ์
+      const access = await getProjectAccess(userId, projectId, { includeDeleted: true });
+      if (!access?.canEdit) {
+        res.status(403).json({ error: "คุณไม่มีสิทธิ์กู้คืนหมุดรังวัดในโครงการนี้" });
+        return;
+      }
+
+      // โครงการของหมุดนี้ถูกลบแล้ว >> ต้องกู้คืนโครงการก่อน
+      const [proj] = await db
+        .select({ deleted_at: projects.deleted_at })
+        .from(projects)
+        .where(eq(projects.id, projectId));
+      if (!proj || proj.deleted_at !== null) {
+        res.status(409).json({ error: "โครงการของหมุดรังวัดนี้ถูกลบแล้ว กรุณากู้คืนโครงการ" });
+        return;
+      }
+
+      const result = await db.transaction(async (tx) => {
+        const [row] = await tx
+          .update(points)
+          .set({ deleted_at: null, deleted_by: null })
+          .where(and(eq(points.id, pointId), isNotNull(points.deleted_at)))
+          .returning({ id: points.id });
+
+        if (!row) return null;
+
+        await tx.insert(pointHistory).values({
+          project_id:         projectId,
+          point_id:           pointId,
+          point_user_restore: userId,
+          point_time_restore: sql`now()`,
+        });
+
+        return await selectPointFull(tx, pointId);
+      });
+
+      if (!result) {
+        res.status(404).json({ error: "ไม่พบหมุดรังวัดในประวัติการลบ" });
+        return;
+      }
+
+      res.status(200).json(result);
+    } catch (e) {
+      console.error("[POST /restore_point] error:", e);
+      res.status(500).json({ error: "กู้คืนหมุดรังวัดไม่สำเร็จ" });
+    }
+  }
+);
+
+
+/// ── ลบถาวรหมุดรังวัดเดียว ก่อนครบ 30 วัน (ต้องอยู่ในประวัติการลบหมุด) ──────────────────
+point_task_Router.delete("/purge_point/:point_id",
+  auth,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const userId  = req.user!;
+      const pointId = parseId(req.params["point_id"]);
+      if (pointId === null) {
+        res.status(400).json({ error: "point ID ไม่ถูกต้อง" });
+        return;
+      }
+
+      const [existing] = await db
+        .select({ id: points.id, project_id: points.project_id })
+        .from(points)
+        .where(and(eq(points.id, pointId), isNotNull(points.deleted_at)));
+
+      if (!existing) {
+        res.status(404).json({ error: "ไม่พบหมุดรังวัดในประวัติการลบ" });
+        return;
+      }
+
+      // โครงการที่ถูกลบแล้ว / ไม่มีสิทธิ์ >> กู้คืนโครงการก่อน
+      const hasAccess = await canEditProject(userId, existing.project_id);
+      if (!hasAccess) {
+        res.status(403).json({ error: "คุณไม่มีสิทธิ์ลบหมุดรังวัดในโครงการนี้" });
+        return;
+      }
+
+      const purged = await purgePointsNow([pointId]);
+      if (purged.length === 0) {
+        res.status(404).json({ error: "ไม่พบหมุดรังวัดในประวัติการลบ" });
+        return;
+      }
+
+      console.log(`[PURGE-NOW] point ${pointId} by user ${userId}`);
+      res.status(200).json({ message: "ลบหมุดรังวัดแบบถาวรสำเร็จ", count: purged.length });
+    } catch (e) {
+      console.error("[DELETE /purge_point] error:", e);
+      res.status(500).json({ error: "ลบหมุดรังวัดแบบถาวรไม่สำเร็จ" });
+    }
+  }
+);
+
+
+/// ── ลบถาวรหมุดรังวัดทั้งหมดในประวัติการลบของโครงการ ก่อนครบ 30 วัน ──────────────────
+point_task_Router.delete("/purge_all_points/:project_id",
+  auth,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const userId    = req.user!;
+      const projectId = parseId(req.params["project_id"]);
+      if (projectId === null) {
+        res.status(400).json({ error: "Project ID ไม่ถูกต้อง" });
+        return;
+      }
+
+      const hasAccess = await canEditProject(userId, projectId);
+      if (!hasAccess) {
+        res.status(403).json({ error: "คุณไม่มีสิทธิ์ลบหมุดรังวัดในโครงการนี้" });
+        return;
+      }
+
+      const rows = await db
+        .select({ id: points.id })
+        .from(points)
+        .where(and(eq(points.project_id, projectId), isNotNull(points.deleted_at)));
+
+      const purged = await purgePointsNow(rows.map((r) => r.id));
+
+      console.log(`[PURGE-NOW] ${purged.length} point(s) of project ${projectId} by user ${userId}`);
+      res.status(200).json({ message: "ลบหมุดรังวัดแบบถาวรสำเร็จ", count: purged.length });
+    } catch (e) {
+      console.error("[DELETE /purge_all_points] error:", e);
+      res.status(500).json({ error: "ลบหมุดรังวัดแบบถาวรไม่สำเร็จ" });
     }
   }
 );
@@ -881,8 +1085,13 @@ point_task_Router.get("/image/:project_id/:point_id/:filename",
         return;
       }
 
+      // ?include_deleted=1 >> ดูรูปในหน้าประวัติการลบ ต้องมีสิทธิ์แก้ไขโครงการ
+      const includeDeleted = req.query["include_deleted"] === "1";
+
       // ตรวจสิทธิ์
-      const hasAccess = await canViewProject(req.user!, projectId);
+      const hasAccess = includeDeleted
+        ? await canEditProject(req.user!, projectId, { includeDeleted: true })
+        : await canViewProject(req.user!, projectId);
       if (!hasAccess) {
         res.status(403).json({ error: "คุณไม่มีสิทธิ์เข้าถึงข้อมูลโครงการ" });
         return;
@@ -891,7 +1100,11 @@ point_task_Router.get("/image/:project_id/:point_id/:filename",
       const [p] = await db
         .select()
         .from(points)
-        .where(and(eq(points.id, pointId), eq(points.project_id, projectId)));
+        .where(and(
+          eq(points.id, pointId),
+          eq(points.project_id, projectId),
+          includeDeleted ? undefined : isNull(points.deleted_at),
+        ));
 
       // ชื่อไฟล์ต้องตรงกับที่บันทึกไว้ใน DB
       const isOwnFile =

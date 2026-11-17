@@ -1,12 +1,15 @@
-import dotenv from "dotenv";
-dotenv.config();
-
 import express from "express";
 import { faultRouter, faultInjector }  from "./middleware/fault.js"
 import { purgeOldOtpChallenges } from "./services/otp.service.js";
 import authRouter from "./routes/auth.js";
 import taskRouter from "./routes/task.js"
 import point_task_Router from "./routes/point_task.js"
+
+import dotenv from "dotenv";
+dotenv.config();
+
+import { startPurgeJob } from "./services/purge.service.js";
+startPurgeJob();
 
 
 const app = express();

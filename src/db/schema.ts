@@ -38,7 +38,7 @@ export const users = pgTable("users", {
   signature:      text("signature"),                     // userID_signature_img_{timestamp}.jpg
 
 },
-// อีเมลห้ามซ้ำแบบไม่สนตัวพิมพ์เล็ก/ใหญ่ (A@x.com กับ a@x.com = คนเดียวกัน)
+// อีเมลห้ามซ้ำแบบไม่สนตัวพิมพ์เล็ก/ใหญ่
 (t) => [uniqueIndex("users_email_lower_idx").on(sql`lower(${t.email})`)]
 );
 
@@ -129,7 +129,12 @@ export const projects = pgTable("projects", {
 
   client_uuid:       uuid("client_uuid").unique(),       // idempotency key จาก client (กันโครงการซ้ำตอน sync)
 
-});
+  deleted_at:        timestamp("deleted_at", { withTimezone: true }),   // null = โครงการยังไม่ถูกลบ | มีค่า = อยู่ในประวัติการลบ (ลบถาวรเมื่อครบ 30 วัน)
+  deleted_by:        integer("deleted_by"),                             // users.id ของผู้ลบ
+
+},
+(t) => [index("projects_deleted_at_idx").on(t.deleted_at)]
+);
 
 /* =======================
    PROJECT MEMBERS TABLE
@@ -162,6 +167,9 @@ export const projectHistory = pgTable("project_history", {
 
   project_user_delete:   integer("project_user_delete"),                               // users.id
   project_time_delete:   timestamp("project_time_delete",   { withTimezone: true }),
+
+  project_user_restore:  integer("project_user_restore"),                              // users.id
+  project_time_restore:  timestamp("project_time_restore",  { withTimezone: true }),
   
 });
 
@@ -244,7 +252,12 @@ export const points = pgTable("points", {
 
   client_uuid:     uuid("client_uuid").unique(),                                // idempotency key จาก client (กันหมุดซ้ำตอน sync)
 
-});
+  deleted_at:      timestamp("deleted_at", { withTimezone: true }),             // null = หมุดรังวัดยังไม่ถูกลบ | มีค่า = อยู่ในประวัติการลบ (ลบถาวรเมื่อครบ 30 วัน)
+  deleted_by:      integer("deleted_by"),                                       // users.id ของผู้ลบ
+
+},
+(t) => [index("points_deleted_at_idx").on(t.deleted_at)]
+);
 
 /* =======================
    POINT DATA JSON TABLE
@@ -281,6 +294,9 @@ export const pointHistory = pgTable("point_history", {
 
   point_user_delete:   integer("point_user_delete"),
   point_time_delete:   timestamp("point_time_delete",   { withTimezone: true }),
+
+  point_user_restore:  integer("point_user_restore"),
+  point_time_restore:  timestamp("point_time_restore",  { withTimezone: true }),
 
 });
 

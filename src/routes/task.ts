@@ -1,15 +1,16 @@
 import { Router } from "express";
 import { auth, requireAdmin, type AuthRequest } from "../middleware/auth.js";
-import { projects, projectMembers, projectHistory, users, usersHistory, points, pointHistory } from "../db/schema.js";
+import { projects, projectMembers, projectHistory, users, usersHistory } from "../db/schema.js";
 import type { NewProject, Project } from "../db/schema.js";
 import { db } from "../db/index.js";
 import { sql } from "drizzle-orm";
 import type { Request, Response } from "express";
-import { eq, asc, desc, and, inArray} from "drizzle-orm";
+import { eq, asc, desc, and, inArray, isNull, isNotNull } from "drizzle-orm";
 import { emptyToNull, toNumericOrNull, toIntOrNull, parseId } from "../helper/null.js";
 import { getProjectCreatorId, getProjectAccess, activeGroupUserIds, everApprovedByAdmin } from "../helper/project_access.js";
-import path from "path";
-import fs from "fs";
+import { daysLeftSql, purgeAtSql, notExpiredSql } from "../helper/trash.js";
+import { logPointsDeletedWithProject, logPointsRestoredWithProject } from "../helper/trash_history.js";
+import { purgeProjectsNow } from "../helper/trash_purge.js";
 
 
 const taskRouter = Router();
@@ -171,7 +172,7 @@ async function findProjectByClientUuid(clientUuid: string, userId: number) {
     .limit(1);
 
   if (!row) return null;
-  const creatorId = await getProjectCreatorId(row.id);
+  const creatorId = await getProjectCreatorId(row.id, { includeDeleted: true }); // รวมโครงการที่อยู่ในประวัติการลบ
   if (creatorId !== userId) return "mismatch" as const; // "mismatch" ถ้า uuid นี้เป็นของ admin คนอื่น
   return row;
 }
@@ -295,7 +296,7 @@ taskRouter.get("/projects", auth, async (req: AuthRequest, res: Response) => {
         })
         .from(projects)
         .leftJoin(projectHistory, eq(projectHistory.project_id, projects.id))
-        .where(eq(projectHistory.project_user_creator, userId))
+        .where(and(eq(projectHistory.project_user_creator, userId), isNull(projects.deleted_at)))
         .orderBy(desc(projectHistory.project_time_created));
 
     } else {
@@ -338,7 +339,7 @@ taskRouter.get("/projects", auth, async (req: AuthRequest, res: Response) => {
         })
         .from(projects)
         .leftJoin(projectHistory, eq(projectHistory.project_id, projects.id))
-        .where(eq(projectHistory.project_user_creator, adminId))
+        .where(and(eq(projectHistory.project_user_creator, adminId), isNull(projects.deleted_at)))
         .orderBy(desc(projectHistory.project_time_created));
     }
 
@@ -499,7 +500,7 @@ taskRouter.put("/update_project/:id", auth, async (req: AuthRequest, res: Respon
 });
 
 
-/// ── ลบโครงการ (admin เท่านั้นที่ลบได้) >> ใช้ id project ในการลบ ────────────
+/// ── ลบโครงการ (admin เท่านั้นที่ลบได้) >> เก็บไว้ 30 วันแล้วค่อยลบถาวร ────────────
 taskRouter.delete("/delete_project/:id", auth, async (req: AuthRequest, res: Response) => {
   try {
     const userId    = req.user!;
@@ -524,60 +525,229 @@ taskRouter.delete("/delete_project/:id", auth, async (req: AuthRequest, res: Res
       return res.status(403).json({ error: "เฉพาะผู้ดูแลโครงการเท่านั้นที่สามารถลบโครงการได้" });
     }
 
-    await db.transaction(async (tx) => {
+    // ไม่ลบ points / point_data_json / project_members / โฟลเดอร์รูป >> เก็บไว้ให้กู้คืนได้
+    const deleted = await db.transaction(async (tx) => {
+      const [row] = await tx
+        .update(projects)
+        .set({ deleted_at: sql`now()`, deleted_by: userId })
+        .where(and(eq(projects.id, projectId), isNull(projects.deleted_at)))
+        .returning({ id: projects.id });
 
-      // 1. ดึง point ทั้งหมดของโครงการ
-      const allPoints = await tx
-        .select({ id: points.id })
-        .from(points)
-        .where(eq(points.project_id, projectId));
+      if (!row) return false;
 
-      // Insert point_history
-      if (allPoints.length > 0) {
-        await tx.insert(pointHistory).values(
-          allPoints.map((p) => ({
-            project_id:        projectId,
-            point_id:          p.id,
-            point_user_delete: userId,
-            point_time_delete: sql`now()`,
-          }))
-        );
-
-        // ลบ points ทั้งหมดของโครงการ
-        await tx
-          .delete(points)
-          .where(eq(points.project_id, projectId));
-      }
-
-      // 2. ลบ project_members
-      await tx
-        .delete(projectMembers)
-        .where(eq(projectMembers.project_id, projectId));
-
-      // Insert project_history
       await tx.insert(projectHistory).values({
         project_id:          projectId,
         project_user_delete: userId,
         project_time_delete: sql`now()`,
       });
 
-      // 3. ลบ projects
-      await tx
-        .delete(projects)
-        .where(eq(projects.id, projectId));
+      // ประวัติทุกหมุด: บันทึกใน point_history
+      await logPointsDeletedWithProject(tx, projectId, userId);
+      return true;
     });
 
-    // 4. ลบโฟเดอร์รูปภาพทั้งหมดของโครงการ
-    const projectDir = path.join("uploads", "point", String(projectId));
-    if (fs.existsSync(projectDir)) {
-      fs.rmSync(projectDir, { recursive: true, force: true });
-      console.log(`[DELETE] removed dir: ${projectDir}`);
+    if (!deleted) {
+      return res.status(404).json({ error: "ไม่พบโครงการที่ต้องการลบ" });
     }
 
     res.status(200).json({ message: "ลบโครงการสำเร็จ" });
   } catch (e) {
     console.error("[DELETE /delete_project] error:", e);
     res.status(500).json({ error: "ลบโครงการไม่สำเร็จ" });
+  }
+});
+
+
+/// ── รายการโครงการที่ถูกลบ เรียงจากลบล่าสุด >> เก่าสุด ────────────
+taskRouter.get("/deleted_projects", auth, requireAdmin, async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user!;
+
+    const rows = await db
+      .select({
+        id:                   projects.id,
+        name_project_id:      projects.name_project_id,
+        project_name:         projects.project_name,
+        project_details:      projects.project_details,
+        province:             projects.province,
+        sensor:               projects.sensor,
+        gsd_num:              projects.gsd_num,
+        gsd_unit:             projects.gsd_unit,
+        survey_main:          projects.survey_main,
+        survey_sub:           projects.survey_sub,
+        project_start_date:   projects.project_start_date,
+        project_end_date:     projects.project_end_date,
+        project_note:         projects.project_note,
+        project_time_created: projectHistory.project_time_created,
+        project_user_creator: projectHistory.project_user_creator,
+
+        deleted_at:           projects.deleted_at,
+        deleted_by:           projects.deleted_by,
+        deleted_by_name:      sql<string | null>`(SELECT concat_ws(' ', u.title_name, u.first_name, u.last_name) FROM users u WHERE u.id = ${projects.deleted_by})`,
+        purge_at:             purgeAtSql(projects.deleted_at),
+        days_left:            daysLeftSql(projects.deleted_at),
+        point_count:          sql<number>`(SELECT count(*)::int FROM points p WHERE p.project_id = ${projects.id} AND p.deleted_at IS NULL)`,
+      })
+      .from(projects)
+      .innerJoin(projectHistory, eq(projectHistory.project_id, projects.id))
+      .where(
+        and(
+          eq(projectHistory.project_user_creator, userId),
+          isNotNull(projects.deleted_at),
+          notExpiredSql(projects.deleted_at),
+        )
+      )
+      .orderBy(desc(projects.deleted_at));
+
+    // สมาชิกในโครงการ
+    const ids = rows.map((r) => r.id);
+    const memberRows = ids.length === 0 ? [] : await db
+      .select({
+        project_id: projectMembers.project_id,
+        user_id:    projectMembers.user_id,
+        status:     users.status,
+        admin:      users.admin,
+      })
+      .from(projectMembers)
+      .innerJoin(users, eq(users.id, projectMembers.user_id))
+      .where(inArray(projectMembers.project_id, ids));
+
+    const memberUserIds = [...new Set(memberRows.map((m) => m.user_id))];
+    const approvals = memberUserIds.length === 0 ? [] : await db
+      .select({ user_id: usersHistory.user_id, admin_id: usersHistory.admin_approved_user })
+      .from(usersHistory)
+      .where(and(
+        inArray(usersHistory.user_id, memberUserIds),
+        sql`${usersHistory.admin_approved_user} IS NOT NULL`
+      ));
+    const approvedPair = new Set(approvals.map((a) => `${a.user_id}:${a.admin_id}`));
+
+    const visibleMembers = memberRows.filter((m) =>
+      m.user_id === userId
+      || (m.status === "user" && m.admin === String(userId))
+      || approvedPair.has(`${m.user_id}:${userId}`)
+    );
+
+    const result = rows.map((r) => ({
+      ...r,
+      member_ids: visibleMembers.filter((m) => m.project_id === r.id).map((m) => m.user_id),
+      user_role:  "Viewer", // โครงการในประวัติการลบ = อ่านอย่างเดียว
+    }));
+
+    res.status(200).json(result);
+  } catch (e) {
+    console.error("[GET /deleted_projects] error:", e);
+    res.status(500).json({ error: "ดึงประวัติการลบโครงการไม่สำเร็จ" });
+  }
+});
+
+
+/// ── กู้คืนโครงการ (ภายใน 30 วันหลังลบ) ────────────
+taskRouter.post("/restore_project/:id", auth, requireAdmin, async (req: AuthRequest, res: Response) => {
+  try {
+    const userId    = req.user!;
+    const projectId = parseId(req.params.id);
+
+    if (projectId === null) {
+      return res.status(400).json({ error: "projectId ไม่ถูกต้อง" });
+    }
+
+    const creatorId = await getProjectCreatorId(projectId, { includeDeleted: true });
+    if (creatorId === null || creatorId !== userId) {
+      return res.status(404).json({ error: "ไม่พบโครงการในประวัติการลบ" });
+    }
+
+    const restored = await db.transaction(async (tx) => {
+      const [row] = await tx
+        .update(projects)
+        .set({ deleted_at: null, deleted_by: null })
+        .where(
+          and(
+            eq(projects.id, projectId),
+            isNotNull(projects.deleted_at),
+            notExpiredSql(projects.deleted_at),
+          )
+        )
+        .returning();
+
+      if (!row) return null;
+
+      await tx.insert(projectHistory).values({
+        project_id:           projectId,
+        project_user_restore: userId,
+        project_time_restore: sql`now()`,
+      });
+
+      // // ประวัติการกู้คืนทุกหมุด: บันทึกใน point_history
+      await logPointsRestoredWithProject(tx, projectId, userId);
+      return row;
+    });
+
+    if (!restored) {
+      return res.status(404).json({ error: "ไม่พบโครงการในประวัติการลบ หรือโครงการอาจครบกำหนด 30 วันแล้ว" });
+    }
+
+    res.status(200).json({ message: "กู้คืนโครงการสำเร็จ", project: restored });
+  } catch (e) {
+    console.error("[POST /restore_project] error:", e);
+    res.status(500).json({ error: "กู้คืนโครงการไม่สำเร็จ" });
+  }
+});
+
+
+/// ── ลบถาวรโครงการเดียว ก่อนครบ 30 วัน (ต้องอยู่ในประวัติการลบ) ────────────
+taskRouter.delete("/purge_project/:id", auth, requireAdmin, async (req: AuthRequest, res: Response) => {
+  try {
+    const userId    = req.user!;
+    const projectId = parseId(req.params.id);
+
+    if (projectId === null) {
+      return res.status(400).json({ error: "projectId ไม่ถูกต้อง" });
+    }
+
+    const creatorId = await getProjectCreatorId(projectId, { includeDeleted: true });
+    if (creatorId === null || creatorId !== userId) {
+      return res.status(404).json({ error: "ไม่พบโครงการในประวัติการลบ" });
+    }
+
+    // ลบได้เฉพาะโครงการที่อยู่ในประวัติการลบ
+    const purged = await purgeProjectsNow([projectId]);
+    if (purged.length === 0) {
+      return res.status(404).json({ error: "ไม่พบโครงการในประวัติการลบ" });
+    }
+
+    console.log(`[PURGE-NOW] project ${projectId} by user ${userId}`);
+    res.status(200).json({ message: "ลบโครงการแบบถาวรสำเร็จ", count: purged.length });
+  } catch (e) {
+    console.error("[DELETE /purge_project] error:", e);
+    res.status(500).json({ error: "ลบโครงการแบบถาวรไม่สำเร็จ" });
+  }
+});
+
+
+/// ── ลบถาวรโครงการทั้งหมดในประวัติการลบ ก่อนครบ 30 วัน ────────────
+taskRouter.delete("/purge_all_projects", auth, requireAdmin, async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user!;
+
+    const rows = await db
+      .select({ id: projects.id })
+      .from(projects)
+      .innerJoin(projectHistory, eq(projectHistory.project_id, projects.id))
+      .where(
+        and(
+          eq(projectHistory.project_user_creator, userId),
+          isNotNull(projects.deleted_at),
+        )
+      );
+
+    const purged = await purgeProjectsNow(rows.map((r) => r.id));
+
+    console.log(`[PURGE-NOW] ${purged.length} project(s) by user ${userId}`);
+    res.status(200).json({ message: "ลบโครงการแบบถาวรสำเร็จ", count: purged.length });
+  } catch (e) {
+    console.error("[DELETE /purge_all_projects] error:", e);
+    res.status(500).json({ error: "ลบโครงการแบบถาวรไม่สำเร็จ" });
   }
 });
 
