@@ -242,8 +242,6 @@ export const points = pgTable("points", {
 
   draw_img:             text("draw_img"),                                       // projectID_pointID_9_draw_img_{timestamp}.jpg
   details_img:          text("details_img"),                                    // projectID_pointID_10_details_img_{timestamp}.jpg
-  
-  draw_description_img: text("draw_description_img"),                           // projectID_pointID_11_draw_description_img_{timestamp}.jpg
 
   survey_technician: integer("survey_technician"),                              // users.id
   survey_qc:         integer("survey_qc"),                                      // users.id

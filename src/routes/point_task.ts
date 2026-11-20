@@ -52,7 +52,6 @@ const IMAGE_FIELDS = [
   "w_survey_img",        // 8
   "draw_img",            // 9
   "details_img",         // 10
-  "draw_description_img", // 11
 ] as const;
 
 type ImageField = typeof IMAGE_FIELDS[number];
