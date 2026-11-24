@@ -169,12 +169,6 @@ export const sendOTP = async ({
 
   const refCode = refCodeFromId(id);
 
-  // แสดงรหัสใน Terminal
-  console.log("-----------------------------------------");
-  console.log(`[OTP DEBUG] Target Email: ${email}`);
-  console.log(`[OTP DEBUG] รหัสอ้างอิง คือ: ${refCode}`);
-  console.log(`[OTP DEBUG] รหัส OTP คือ: ${otp}`);
-
   // 4. ส่งอีเมล
   if (deliver) {
     try {
