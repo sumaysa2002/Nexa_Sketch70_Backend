@@ -4,7 +4,7 @@ import { db } from "../db/index.js"; // ตัวเชื่อม Drizzle  ↔
 import { users, usersHistory } from "../db/schema.js";
 import { eq, ne, and, or, sql, asc, inArray, isNull } from "drizzle-orm"; // ฟังก์ชันช่วยเขียน WHERE email = ?   เพิ่ม sql 
 import bcryptjs from "bcryptjs"; // ใช้ hash password
-import jwt from "jsonwebtoken";
+import { createSession, revokeSession, revokeAllSessions, revokeOtherSessions, sessionMaxExpiresAt } from "../helper/session.js";
 import { auth, requireAdmin, type AuthRequest } from "../middleware/auth.js"; // ใช้ตรวจสอบ JWT token ก่อนเข้าถึง route ที่ต้อง login
 import {
   sendOTP,
@@ -463,14 +463,15 @@ authRouter.post("/login/verify_otp", async (req: Request, res: Response) => {
           return res.status(404).json({ message: "ไม่พบผู้ใช้งาน" });
         }
 
-        // สร้าง JWT ด้วย id ที่มาจาก DB
-        const token = jwt.sign(
-          { id: user.id },
-          process.env.ACCESS_TOKEN_SECRET!,
-          { expiresIn: "7d" }
-        );
+        // สร้าง session ใหม่ (1 เครื่อง = 1 session) >> ได้ token สุ่มกลับมา DB เก็บแค่ hash
+        const token = await createSession(user.id);
 
-        res.json({ token, ...sanitizeUser(user) });
+        // session_max_expires_at >> แอปใช้แสดงแถบเตือนเมื่อใกล้หมดรอบการใช้งาน
+        res.json({
+          token,
+          session_max_expires_at: sessionMaxExpiresAt(new Date()).toISOString(),
+          ...sanitizeUser(user),
+        });
 
     } catch (error) {
         res.status(500).json({ message: "ยืนยัน OTP ล้มเหลว" });
@@ -534,6 +535,9 @@ authRouter.post("/login/reset_password/verify_and_reset", async (req: Request, r
         .returning();
  
       if (!updatedUser) throw new Error("ไม่พบผู้ใช้งาน");
+
+      // ลืมรหัสผ่าน >> ทุกเครื่องที่ login หลุด
+      await revokeAllSessions(updatedUser.id, tx);
  
       // Insert users_history
       await tx.insert(usersHistory).values({
@@ -571,11 +575,39 @@ authRouter.get("/user_data", auth, async (req: AuthRequest, res) => {
         if (!user) {
           return res.status(404).json({ error: "ไม่พบผู้ใช้งาน" });
         }
-        res.json({ ...sanitizeUser(user), token: req.token });
+        res.json({
+          ...sanitizeUser(user),
+          token: req.token,
+          session_max_expires_at: req.sessionMaxExpiresAt?.toISOString(),
+        });
     } catch (e) {
         res.status(500).json(false);
     }
 
+});
+
+
+/// ── Logout >> ออกจากระบบเครื่องนี้ ──────────────────────────────────────
+authRouter.post("/logout", auth, async (req: AuthRequest, res: Response) => {
+  try {
+    await revokeSession(req.sessionHash!);
+    res.status(200).json({ message: "ออกจากระบบสำเร็จ" });
+  } catch (e) {
+    console.error("[POST /logout] error:", e);
+    res.status(500).json({ error: "ออกจากระบบไม่สำเร็จ" });
+  }
+});
+
+
+/// ── Logout ทุกเครื่อง >> เพิกถอนทุก session ของ user นี้ทั้งหมด ──────────────────────────────────────
+authRouter.post("/logout_all", auth, async (req: AuthRequest, res: Response) => {
+  try {
+    await revokeAllSessions(req.user!);
+    res.status(200).json({ message: "ออกจากระบบทุกเครื่องสำเร็จ" });
+  } catch (e) {
+    console.error("[POST /logout_all] error:", e);
+    res.status(500).json({ error: "ออกจากระบบไม่สำเร็จ" });
+  }
 });
 
 
@@ -746,6 +778,9 @@ authRouter.put("/profile/reset_password", auth, async (req: AuthRequest, res: Re
         .update(users)
         .set({ password: hashedPassword })
         .where(eq(users.id, userId));
+
+      // เปลี่ยนรหัสผ่าน >> เครื่องอื่นทุกเครื่องหลุดยกเว้นเครื่องนี้
+      await revokeOtherSessions(userId, req.sessionHash!, tx);
 
       // Insert users_history
       await tx.insert(usersHistory).values({

@@ -69,6 +69,21 @@ export const usersHistory = pgTable("users_history", {
 });
 
 /* =======================
+   USER SESSIONS TABLE
+   1 แถว = 1 การ login (1 เครื่อง) ของ user
+======================= */
+export const userSessions = pgTable("user_sessions", {
+
+  token_hash:     text("token_hash").primaryKey(),                                                     // SHA-256 (hex) ของ token
+  user_id:        integer("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  created_at:     timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),              // เวลา login
+  last_seen_at:   timestamp("last_seen_at", { withTimezone: true }).notNull().defaultNow(),            // ใช้งานล่าสุด
+  revoked_at:     timestamp("revoked_at", { withTimezone: true }),                                     // มีค่า = token ถูกเพิกถอนแล้ว
+},
+(t) => [index("user_sessions_user_idx").on(t.user_id)]
+);
+
+/* =======================
    OTP CHALLENGES TABLE
    เก็บสถานะ OTP ฝั่ง server (ใช้ได้ครั้งเดียว / จำกัดจำนวนครั้งที่เดา / ผูกกับ purpose)
    ทุกครั้งที่ระบบส่ง OTP จะเพิ่ม 1 แถวในตาราง

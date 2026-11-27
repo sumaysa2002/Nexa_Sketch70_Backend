@@ -1,13 +1,23 @@
 import type { NextFunction, Request, Response } from "express";
-import jwt from "jsonwebtoken"; // ใช้ verify JWT
-import { db } from "../db/index.js"; // ตัวเชื่อม database (Drizzle)
-import { users } from "../db/schema.js"; // ตาราง users
-import { eq } from "drizzle-orm"; // helper ของ Drizzle สำหรับ WHERE
+import { and, eq } from "drizzle-orm";
+import { db } from "../db/index.js";
+import { users, userSessions } from "../db/schema.js";
+import {
+  hashToken,
+  touchSession,
+  sessionIsActive,
+  sessionMaxExpiresAt,
+  TOKEN_PREFIX,
+  TOKEN_MAX_LENGTH,
+  SESSION_TOUCH_INTERVAL_MS,
+} from "../helper/session.js";
 
 // AuthRequest Interface
 export interface AuthRequest extends Request {
   user?: number; // id ของ user
-  token?: string; // jwt token
+  token?: string; // session token (ค่าจริง)
+  sessionHash?: string; // SHA-256 ของ token = รหัส session token
+  sessionMaxExpiresAt?: Date; // วันหมดอายุสูงสุดของ session นี้
 }
 
 export const auth = async (
@@ -26,36 +36,51 @@ export const auth = async (
           return;
         }
 
-    // ตรวจสอบ JWT (verify) >> ตรวจลายเซ็น, ตรวจว่า token ถูกสร้างด้วย secret เดียวกัน, ตรวจว่า token ไม่พัง / ไม่โดนแก้
-    const verified = jwt.verify(token, process.env.ACCESS_TOKEN_SECRET!);
-
-    // ถ้า token ผิด → throw error → เข้า catch
-    if (!verified) {
-      res.status(401).json({ error: "การตรวจสอบ Token ล้มเหลว" });
+    // รูปแบบ token ผิด
+    if (!token.startsWith(TOKEN_PREFIX) || token.length > TOKEN_MAX_LENGTH) {
+      res.status(401).json({ error: "Token ไม่ถูกต้องหรือหมดอายุ" });
       return;
     }
 
-    // แปลง payload จาก token
-    const verifiedToken = verified as { id: number };
+    // ค้น session จาก hash ของ token
+    const tokenHash = hashToken(token);
+    const [session] = await db
+      .select({
+        user_id: userSessions.user_id,
+        last_seen_at: userSessions.last_seen_at,
+        created_at: userSessions.created_at,
+      })
+      .from(userSessions)
+      .innerJoin(users, eq(users.id, userSessions.user_id)) // user ถูกลบ >> ไม่มี session ที่ใช้ได้
+      .where(
+        and(
+          eq(userSessions.token_hash, tokenHash),
+          sessionIsActive
+        )
+      )
+      .limit(1);
 
-    // ตรวจสอบ user ใน database
-    const [user] = await db
-      .select()
-      .from(users)
-      .where(eq(users.id, verifiedToken.id));
+    // ไม่พบ / ถูกเพิกถอน / หมดอายุ 
+    if (!session) {
+      res.status(401).json({ error: "Token ไม่ถูกต้อง หมดอายุ หรือถูกเพิกถอนจากระบบแล้ว กรุณาเข้าสู่ระบบใหม่อีกครั้ง" });
+      return;
+    }
 
-        // ถ้าไม่มี user → access denied
-        if (!user) {
-        res.status(401).json({ error: "ไม่พบผู้ใช้งานในฐานข้อมูล" });
-        return;
-        }
+    // ต่ออายุแบบ sliding: บันทึกว่าเพิ่งใช้งาน
+    if (Date.now() - session.last_seen_at.getTime() > SESSION_TOUCH_INTERVAL_MS) {
+      touchSession(tokenHash).catch((e) => console.error("[auth] touchSession error:", e));
+    }
 
-    // แนบข้อมูล user ลง req >> จากนี้ route ถัดไปจะใช้ req.user (id ของ user ที่ login แล้ว)
-    req.user = verifiedToken.id;
+    // แนบข้อมูล user ลง req >> route ใช้ req.user (id ของ user ที่ login แล้ว)
+    req.user = session.user_id;
     req.token = token;
+    req.sessionHash = tokenHash;
+    req.sessionMaxExpiresAt = sessionMaxExpiresAt(session.created_at);
     next();
   } catch (e) {
-    res.status(401).json({ error: "Token ไม่ถูกต้องหรือหมดอายุ" });
+    // error ที่ไม่คาดคิด >> ต้องไม่ตอบ 401 (เพราะ 401 แอปจะเข้าใจว่า session ถูกเพิกถอน)
+    console.error("[auth] middleware error:", e);
+    res.status(500).json({ error: "ตรวจสอบสิทธิ์ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" });
   }
 };
 

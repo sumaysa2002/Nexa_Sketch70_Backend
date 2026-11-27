@@ -9,6 +9,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 import { startPurgeJob } from "./services/purge.service.js";
+import { purgeExpiredSessions, SESSION_IDLE_DAYS, SESSION_MAX_DAYS } from "./helper/session.js";
 startPurgeJob();
 
 
@@ -39,13 +40,13 @@ app.use((req, res) => {
   res.status(404).json({ message: "Route not found on server" });
 });
 
-if (!process.env.ACCESS_TOKEN_SECRET) {
-  throw new Error("ACCESS_TOKEN_SECRET is not set in .env");
-}
-
 app.listen(3000, "0.0.0.0",() => {
   console.log('Server started on port 3000');
 
   // ลบ OTP ที่หมดอายุเกิน 1 วัน ทุก 6 ชั่วโมง
   setInterval(() => purgeOldOtpChallenges().catch(console.error), 6 * 60 * 60 * 1000);
+
+  // ลบ session ที่หมดอายุ / ถูกเพิกถอนแล้ว ทุก 6 ชั่วโมง
+  purgeExpiredSessions().catch(console.error);
+  setInterval(() => purgeExpiredSessions().catch(console.error), 6 * 60 * 60 * 1000);
 });
