@@ -586,31 +586,6 @@ authRouter.get("/user_data", auth, async (req: AuthRequest, res) => {
 
 });
 
-
-/// ── Logout >> ออกจากระบบเครื่องนี้ ──────────────────────────────────────
-authRouter.post("/logout", auth, async (req: AuthRequest, res: Response) => {
-  try {
-    await revokeSession(req.sessionHash!);
-    res.status(200).json({ message: "ออกจากระบบสำเร็จ" });
-  } catch (e) {
-    console.error("[POST /logout] error:", e);
-    res.status(500).json({ error: "ออกจากระบบไม่สำเร็จ" });
-  }
-});
-
-
-/// ── Logout ทุกเครื่อง >> เพิกถอนทุก session ของ user นี้ทั้งหมด ──────────────────────────────────────
-authRouter.post("/logout_all", auth, async (req: AuthRequest, res: Response) => {
-  try {
-    await revokeAllSessions(req.user!);
-    res.status(200).json({ message: "ออกจากระบบทุกเครื่องสำเร็จ" });
-  } catch (e) {
-    console.error("[POST /logout_all] error:", e);
-    res.status(500).json({ error: "ออกจากระบบไม่สำเร็จ" });
-  }
-});
-
-
 /// ── Profile Edit >> update ข้อมูล User ──────────────────────────────────────
 authRouter.put("/update_user", 
   auth, 
@@ -796,6 +771,31 @@ authRouter.put("/profile/reset_password", auth, async (req: AuthRequest, res: Re
     res.status(500).json({ message: "เปลี่ยนรหัสผ่านไม่สำเร็จ" });
   }
 });
+
+
+/// ── Logout >> ออกจากระบบเครื่องนี้ ──────────────────────────────────────
+authRouter.post("/logout", auth, async (req: AuthRequest, res: Response) => {
+  try {
+    await revokeSession(req.sessionHash!);
+    res.status(200).json({ message: "ออกจากระบบสำเร็จ" });
+  } catch (e) {
+    console.error("[POST /logout] error:", e);
+    res.status(500).json({ error: "ออกจากระบบไม่สำเร็จ" });
+  }
+});
+
+
+/// ── Logout ทุกเครื่อง >> เพิกถอนทุก session ของ user นี้ทั้งหมด ──────────────────────────────────────
+authRouter.post("/logout_all", auth, async (req: AuthRequest, res: Response) => {
+  try {
+    await revokeAllSessions(req.user!);
+    res.status(200).json({ message: "ออกจากระบบทุกเครื่องสำเร็จ" });
+  } catch (e) {
+    console.error("[POST /logout_all] error:", e);
+    res.status(500).json({ error: "ออกจากระบบไม่สำเร็จ" });
+  }
+});
+
 
 
 
